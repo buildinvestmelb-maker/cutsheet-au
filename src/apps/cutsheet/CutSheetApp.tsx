@@ -1233,45 +1233,52 @@ function CutSheetWorkbench({
     }
   }, []);
 
+  const resolveDealHashAccess = useCallback(
+    async (activeSess: MapLabUserSession | null) => {
+      if (typeof window === 'undefined') return;
+      const dealMatch = window.location.hash.match(/deal=([^&]+)/);
+      if (!dealMatch?.[1]) return;
+      const requestedId = decodeURIComponent(dealMatch[1]);
+      const lookup = await loadPrivateDealById(activeSess, requestedId);
+      if (lookup.status === 'ok') {
+        setPrivateAccessBlockedMsg(null);
+        applySavedDealToWorkspace(lookup.deal);
+      } else if (lookup.status === 'unauthenticated') {
+        setPrivateAccessBlockedMsg(
+          'This saved site is private. Sign in with the owning account to view it.',
+        );
+        setVaultOpen(true);
+      } else if (lookup.status === 'access-denied') {
+        setPrivateAccessBlockedMsg(
+          'Access blocked: this private site belongs to another Map Lab. DA account.',
+        );
+        setVaultOpen(true);
+      }
+    },
+    [applySavedDealToWorkspace],
+  );
+
   useEffect(() => {
     let active = true;
     const bootVault = async () => {
       await refreshSavedDeals(session);
-      if (!active || typeof window === 'undefined') return;
-      const dealMatch = window.location.hash.match(/deal=([^&]+)/);
-      if (dealMatch?.[1]) {
-        const requestedId = decodeURIComponent(dealMatch[1]);
-        const lookup = await loadPrivateDealById(session, requestedId);
-        if (!active) return;
-        if (lookup.status === 'ok') {
-          setPrivateAccessBlockedMsg(null);
-          applySavedDealToWorkspace(lookup.deal);
-        } else if (lookup.status === 'unauthenticated') {
-          setPrivateAccessBlockedMsg(
-            'This saved site is private. Sign in with the owning account to view it.',
-          );
-          setVaultOpen(true);
-        } else if (lookup.status === 'access-denied') {
-          setPrivateAccessBlockedMsg(
-            'Access blocked: this private site belongs to another Map Lab. DA account.',
-          );
-          setVaultOpen(true);
-        }
-      }
+      if (!active) return;
+      await resolveDealHashAccess(session);
     };
     void bootVault();
     return () => {
       active = false;
     };
-  }, [applySavedDealToWorkspace, refreshSavedDeals, session]);
+  }, [refreshSavedDeals, resolveDealHashAccess, session]);
 
-  // Browser Back / Forward / Hash recovery
+  // Browser Back / Forward / Same-tab #deal= & #tab= Hash recovery
   useEffect(() => {
     const onHashChange = () => {
       const m = window.location.hash.match(/tab=(deal-rlv|cut-cost|terrain|plan-flow)/);
       if (m) {
         setInspectorTab(m[1] as InspectorTab);
       }
+      void resolveDealHashAccess(session);
     };
     window.addEventListener('hashchange', onHashChange);
     window.addEventListener('popstate', onHashChange);
@@ -1279,7 +1286,7 @@ function CutSheetWorkbench({
       window.removeEventListener('hashchange', onHashChange);
       window.removeEventListener('popstate', onHashChange);
     };
-  }, []);
+  }, [resolveDealHashAccess, session]);
 
   const handleSelectInspectorTab = useCallback(
     (next: InspectorTab) => {
