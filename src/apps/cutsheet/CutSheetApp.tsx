@@ -1,4 +1,4 @@
-import type { FeatureCollection } from 'geojson';
+import type { FeatureCollection, Polygon } from 'geojson';
 import {
   Activity,
   AlertTriangle,
@@ -7,6 +7,7 @@ import {
   ChevronDown,
   ChevronUp,
   CloudDownload,
+  Compass,
   Crosshair,
   Download,
   Droplets,
@@ -15,9 +16,12 @@ import {
   FileSpreadsheet,
   FileText,
   Flame,
+  FolderOpen,
   Globe,
+  Landmark,
   Layers,
   Loader2,
+  LocateFixed,
   Map as MapIcon,
   Mountain,
   MousePointer2,
@@ -30,11 +34,13 @@ import {
   Search,
   Send,
   Share2,
+  ShieldAlert,
   SlidersHorizontal,
   Sparkles,
   Square,
   TrendingUp,
   Upload,
+  User,
   X,
 } from 'lucide-react';
 import {
@@ -52,6 +58,25 @@ import {
   type SiteEarthworks,
   type SiteProject,
 } from '../../bridge/types';
+import {
+  listPrivateDeals,
+  loadActiveSession,
+  loadPrivateDealById,
+  savePrivateDeal,
+  type MapLabUserSession,
+  type SavedMapLabDeal,
+} from '../../data/cloudDealStore';
+import {
+  BAL_BENCHMARKS,
+  computeMapLabDealIntelligence,
+  createDefaultDealFinancialInputs,
+  optimizeGradingForMaxRlv,
+  validateNonNegativeNumber,
+  type BalRating,
+  type DealFinancialInputs,
+  type EnvironmentalConstraintInputs,
+  type RlvOptimizationResult,
+} from '../../engines/deal/mapLabIntelligenceEngine';
 import {
   buildCutSheetPdfBlob,
   buildEarthworksBoqCsv,
@@ -93,12 +118,18 @@ import {
   computePolygonMetrics,
   createRectPolygonFeatureCollection,
   extractPrimaryPolygon,
-  getPublicCadastreLayerForState,
   isWithinAustralianBounds,
   searchAustralianAddresses,
   type AuGeocodedAddress,
   type MapBasemapMode,
 } from '../../engines/geo/auGeoKernel';
+import {
+  ALL_8_AU_CAPITALS,
+  AU_STATE_SPATIAL_REGISTRY,
+  isWithinAustraliaBounds,
+  snapLegalParcelAtPoint,
+  type AuStateSpatialProfile,
+} from '../../engines/geo/auParcelClient';
 import { AppShellFrame } from '../shared/AppShellFrame';
 import {
   downloadBlobFile,
@@ -106,40 +137,26 @@ import {
   slugifyFilename,
 } from '../shared/downloadFile';
 import { useOsBridge } from '../shared/useOsBridge';
+import { DealIntelligencePanel } from './DealIntelligencePanel';
+import { DealVaultDrawer } from './DealVaultDrawer';
 import { SectionProfileChart } from './SectionProfileChart';
 import { TerrainMap2D, type CutSheetCadTool } from './TerrainMap2D';
 import { TerrainViewport3D } from './TerrainViewport3D';
 
-type InspectorTab = 'terrain' | 'plan-flow' | 'cut-cost';
+type InspectorTab = 'deal-rlv' | 'cut-cost' | 'terrain' | 'plan-flow';
 type MainViewportMode = 'map' | '3d-studio';
 type VolumeMode = 'dem' | 'manual';
-
-interface CapitalJumpCity {
-  code: string;
-  label: string;
-  state: AustralianState;
-  lat: number;
-  lng: number;
-  baseAHD: number;
-}
-
-const CAPITAL_CITIES: readonly CapitalJumpCity[] = [
-  { code: 'SYD', label: 'Sydney', state: 'NSW', lat: -33.8688, lng: 151.2093, baseAHD: 36 },
-  { code: 'MEL', label: 'Melbourne', state: 'VIC', lat: -37.8136, lng: 144.9631, baseAHD: 42 },
-  { code: 'BNE', label: 'Brisbane', state: 'QLD', lat: -27.4698, lng: 153.0251, baseAHD: 28 },
-  { code: 'PER', label: 'Perth', state: 'WA', lat: -31.9505, lng: 115.8605, baseAHD: 22 },
-  { code: 'ADL', label: 'Adelaide', state: 'SA', lat: -34.9285, lng: 138.6007, baseAHD: 48 },
-] as const;
+type MobileSheetMode = 'split' | 'map' | 'inspector';
 
 const STATE_PLANNING_AUTHORITY: Readonly<Record<AustralianState, string>> = {
-  NSW: 'NSW Spatial Services (SIX Maps) • ePlanning',
-  VIC: 'Vicmap Spatial • Planning Schemes Online',
-  QLD: 'Queensland Globe • SPP Interactive Mapping',
-  WA: 'Landgate SLIP • PlanWA Spatial Cadastre',
-  SA: 'Location SA • PlanSA SAPPA Cadastre',
-  TAS: 'LISTmap Tasmania • TasPlanning Overlay',
-  ACT: 'ACTmapi • Territory Plan GIS',
-  NT: 'NR Maps • NT Planning Scheme Spatial',
+  NSW: AU_STATE_SPATIAL_REGISTRY.NSW.authority,
+  VIC: AU_STATE_SPATIAL_REGISTRY.VIC.authority,
+  QLD: AU_STATE_SPATIAL_REGISTRY.QLD.authority,
+  WA: AU_STATE_SPATIAL_REGISTRY.WA.authority,
+  SA: AU_STATE_SPATIAL_REGISTRY.SA.authority,
+  TAS: AU_STATE_SPATIAL_REGISTRY.TAS.authority,
+  ACT: AU_STATE_SPATIAL_REGISTRY.ACT.authority,
+  NT: AU_STATE_SPATIAL_REGISTRY.NT.authority,
 };
 
 const STATE_DEFAULT_FFL: Readonly<Record<AustralianState, number>> = {
@@ -621,11 +638,68 @@ function CutSheetWorkbench({
   );
   const activeState: AustralianState = customStateCode ?? project.location.state;
 
-  // Layout & viewport state
+  // Layout & viewport state (standalone Map Lab. DA opens directly to Paddock-to-Offer Deal & RLV!)
   const [viewportMode, setViewportMode] = useState<MainViewportMode>('map');
-  const [inspectorTab, setInspectorTab] = useState<InspectorTab>('cut-cost');
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>(() => {
+    if (typeof window !== 'undefined') {
+      const m = window.location.hash.match(/tab=(deal-rlv|cut-cost|terrain|plan-flow)/);
+      if (m) return m[1] as InspectorTab;
+    }
+    return isStandalone ? 'deal-rlv' : 'cut-cost';
+  });
   const [inspectorOpen, setInspectorOpen] = useState<boolean>(true);
+  const [mobileSheetMode, setMobileSheetMode] = useState<MobileSheetMode>('split');
   const [sectionDrawerOpen, setSectionDrawerOpen] = useState<boolean>(false);
+
+  // Connected Cross-App Intelligence (EnviroSim Constraints + FormGen Yield + Feaso OS 8-State RLV)
+  const [envConstraints, setEnvConstraints] = useState<EnvironmentalConstraintInputs>({
+    balRating: 'BAL-12.5',
+    floodOverlayPct: 0,
+    riparianBiodiversityPct: 0,
+  });
+  const [finInputs, setFinInputs] = useState<DealFinancialInputs>(() =>
+    createDefaultDealFinancialInputs(project.location.state, 'subdivision'),
+  );
+  const [optimizingRlv, setOptimizingRlv] = useState<boolean>(false);
+  const [lastRlvOpt, setLastRlvOpt] = useState<RlvOptimizationResult | null>(null);
+
+  // Universal 8-State Live Legal Parcel Snap & Mobile GPS Field Mode state
+  const [parcelSnapLoading, setParcelSnapLoading] = useState<boolean>(false);
+  const [parcelSnapNotice, setParcelSnapNotice] = useState<{
+    kind: 'success' | 'warning' | 'error';
+    text: string;
+    retryCoords?: { lat: number; lng: number };
+  } | null>(null);
+  const [activeParcelId, setActiveParcelId] = useState<string>(
+    project.geometry.parcelId ?? '',
+  );
+  const [activeParcelProvenance, setActiveParcelProvenance] = useState<string>(
+    'Initial Screening Parcel + Local Terrain DTM',
+  );
+  const [gpsLoading, setGpsLoading] = useState<boolean>(false);
+  const [rateInputError, setRateInputError] = useState<string | null>(null);
+
+  // Cloud Account & Private Saved Sites Vault state
+  const [vaultOpen, setVaultOpen] = useState<boolean>(false);
+  const [session, setSession] = useState<MapLabUserSession | null>(() =>
+    loadActiveSession(),
+  );
+  const [savedDeals, setSavedDeals] = useState<SavedMapLabDeal[]>([]);
+  const [dealsLoading, setDealsLoading] = useState<boolean>(false);
+  const [dealsError, setDealsError] = useState<string | null>(null);
+  const [activeDealId, setActiveDealId] = useState<string | null>(null);
+  const [siteNameDraft, setSiteNameDraft] = useState<string>(
+    project.name || 'Australian Development Site',
+  );
+  const [saveBusy, setSaveBusy] = useState<boolean>(false);
+  const [saveFeedback, setSaveFeedback] = useState<{
+    kind: 'success' | 'error';
+    text: string;
+  } | null>(null);
+  const [privateAccessBlockedMsg, setPrivateAccessBlockedMsg] = useState<string | null>(
+    null,
+  );
+
   const [basemapMode, setBasemapMode] = useState<MapBasemapMode>(() =>
     typeof navigator !== 'undefined' && navigator.onLine === false
       ? 'offline-grid'
@@ -843,18 +917,14 @@ function CutSheetWorkbench({
   }, [retainingOverrideStr]);
 
   // EnviroSim flood/exclusion area hook if present on SiteProject
-  const enviroFloodHa = useMemo(() => {
-    const grossSqm = activeMetrics?.grossAreaSqm ?? project.geometry?.grossAreaSqm ?? 0;
-    const envNda = project.geometry?.netDevelopableAreaSqm;
-    if (
-      project.environment?.floodOverlay &&
-      typeof envNda === 'number' &&
-      grossSqm > envNda
-    ) {
-      return roundTwo(((grossSqm - envNda) * 0.35) / 10_000);
-    }
-    return 0;
-  }, [activeMetrics?.grossAreaSqm, project.environment?.floodOverlay, project.geometry?.grossAreaSqm, project.geometry?.netDevelopableAreaSqm]);
+  const enviroGrossSqm = activeMetrics?.grossAreaSqm ?? project.geometry.grossAreaSqm ?? 0;
+  const enviroNdaSqm = project.geometry.netDevelopableAreaSqm;
+  const enviroFloodHa =
+    project.environment?.floodOverlay &&
+    typeof enviroNdaSqm === 'number' &&
+    enviroGrossSqm > enviroNdaSqm
+      ? roundTwo(((enviroGrossSqm - enviroNdaSqm) * 0.35) / 10_000)
+      : 0;
 
   // Pass 1: Grid earthworks solver (polygon-clipped, 4 strategies)
   const baseGridResult = useMemo<EarthworksGridResult>(() => {
@@ -1079,11 +1149,148 @@ function CutSheetWorkbench({
     );
   }, [activeDemGrid, effectiveResult.deltaGrid, sectionEnd, sectionStart]);
 
+  // Connected Cross-App Intelligence (CutSheet + EnviroSim + FormGen + Feaso OS 8-State RLV)
+  const dealIntelligence = useMemo(
+    () =>
+      computeMapLabDealIntelligence({
+        state: activeState,
+        grossAreaSqm: effectiveResult.insideAreaSqm,
+        hydrology,
+        earthworksCostAud: effectiveResult.totalPackageAud,
+        minElevationAHD: activeDemGrid.minAHD,
+        env: envConstraints,
+        fin: finInputs,
+      }),
+    [
+      activeDemGrid.minAHD,
+      activeState,
+      effectiveResult.insideAreaSqm,
+      effectiveResult.totalPackageAud,
+      envConstraints,
+      finInputs,
+      hydrology,
+    ],
+  );
+
+  const combinedProvenanceLabel = `${activeParcelProvenance} • ${activeDemGrid.sourceLabel} (${activeMga.mgaEpsg})`;
+
   // --- Handlers ---
 
-  const triggerFlyTo = (lng: number, lat: number, zoom = 15.2) => {
+  const triggerFlyTo = useCallback((lng: number, lat: number, zoom = 15.2) => {
     setFlyToTarget({ lng, lat, zoom, seq: Date.now() });
-  };
+  }, []);
+
+  const applySavedDealToWorkspace = useCallback(
+    (deal: SavedMapLabDeal) => {
+      setCustomBoundary(deal.boundary);
+      setCustomStateCode(deal.state);
+      setCustomSiteLabel(deal.name);
+      setSiteNameDraft(deal.name);
+      setActiveDealId(deal.id);
+      setActiveParcelId(deal.parcelId);
+      setActiveParcelProvenance(`Saved Site (${deal.state} Vault)`);
+      setGradingStrategy(deal.gradingStrategy);
+      setFflInputStr(deal.targetFflAHD.toFixed(2));
+      setTargetCutFillRatio(deal.targetCutFillRatio);
+      setSoilClass(deal.soilClass);
+      setRockBreakoutPct(deal.rockBreakoutPct);
+      setTopsoilDepthMm(Math.round(deal.topsoilDepthM * 1000));
+      setCustomRates(deal.ratesOverride);
+      setEnvConstraints(deal.env);
+      setFinInputs(deal.fin);
+      setCustomDemState(null);
+      setCustomTransect(null);
+      setVolumeMode('dem');
+      setRetainingOverrideStr(null);
+      setLastRlvOpt(null);
+      setViewportMode('map');
+      triggerFlyTo(deal.lng, deal.lat, 15.5);
+      if (typeof window !== 'undefined') {
+        window.history.replaceState(
+          null,
+          '',
+          `#deal=${encodeURIComponent(deal.id)}&tab=${inspectorTab}`,
+        );
+      }
+    },
+    [inspectorTab, triggerFlyTo],
+  );
+
+  const refreshSavedDeals = useCallback(async (activeSess: MapLabUserSession | null) => {
+    if (!activeSess) {
+      setSavedDeals([]);
+      setDealsError(null);
+      return;
+    }
+    setDealsLoading(true);
+    setDealsError(null);
+    const res = await listPrivateDeals(activeSess);
+    setDealsLoading(false);
+    if (res.ok) {
+      setSavedDeals(res.deals);
+    } else {
+      setDealsError(res.error);
+    }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const bootVault = async () => {
+      await refreshSavedDeals(session);
+      if (!active || typeof window === 'undefined') return;
+      const dealMatch = window.location.hash.match(/deal=([^&]+)/);
+      if (dealMatch?.[1]) {
+        const requestedId = decodeURIComponent(dealMatch[1]);
+        const lookup = await loadPrivateDealById(session, requestedId);
+        if (!active) return;
+        if (lookup.status === 'ok') {
+          setPrivateAccessBlockedMsg(null);
+          applySavedDealToWorkspace(lookup.deal);
+        } else if (lookup.status === 'unauthenticated') {
+          setPrivateAccessBlockedMsg(
+            'This saved site is private. Sign in with the owning account to view it.',
+          );
+          setVaultOpen(true);
+        } else if (lookup.status === 'access-denied') {
+          setPrivateAccessBlockedMsg(
+            'Access blocked: this private site belongs to another Map Lab. DA account.',
+          );
+          setVaultOpen(true);
+        }
+      }
+    };
+    void bootVault();
+    return () => {
+      active = false;
+    };
+  }, [applySavedDealToWorkspace, refreshSavedDeals, session]);
+
+  // Browser Back / Forward / Hash recovery
+  useEffect(() => {
+    const onHashChange = () => {
+      const m = window.location.hash.match(/tab=(deal-rlv|cut-cost|terrain|plan-flow)/);
+      if (m) {
+        setInspectorTab(m[1] as InspectorTab);
+      }
+    };
+    window.addEventListener('hashchange', onHashChange);
+    window.addEventListener('popstate', onHashChange);
+    return () => {
+      window.removeEventListener('hashchange', onHashChange);
+      window.removeEventListener('popstate', onHashChange);
+    };
+  }, []);
+
+  const handleSelectInspectorTab = useCallback(
+    (next: InspectorTab) => {
+      setInspectorTab(next);
+      if (typeof window !== 'undefined' && isStandalone) {
+        const dealPart = activeDealId ? `deal=${encodeURIComponent(activeDealId)}&` : '';
+        window.history.pushState(null, '', `#${dealPart}tab=${next}`);
+      }
+    },
+    [activeDealId, isStandalone],
+  );
 
   const handleBoundaryDrawn = useCallback((fc: FeatureCollection) => {
     setCustomBoundary(fc);
@@ -1092,59 +1299,278 @@ function CutSheetWorkbench({
     setVolumeMode('dem');
     setRetainingOverrideStr(null);
     setOptFeedback(null);
+    setLastRlvOpt(null);
+    setActiveDealId(null);
+    setParcelSnapNotice(null);
     try {
       const m = computePolygonMetrics(fc);
       const st = inferAuStateFromLngLat(m.centroid.lng, m.centroid.lat);
       setCustomStateCode(st);
-      setCustomSiteLabel(`Drawn Site Parcel (${m.grossAreaHa.toFixed(2)} ha)`);
+      setFinInputs((prev) =>
+        createDefaultDealFinancialInputs(st, prev.typology),
+      );
+      setActiveParcelId('');
+      setActiveParcelProvenance(`User-Drawn Site Boundary (${st})`);
+      const label = `Drawn Site Parcel (${m.grossAreaHa.toFixed(2)} ha)`;
+      setCustomSiteLabel(label);
+      setSiteNameDraft(label);
     } catch {
       setCustomSiteLabel('Drawn Site Parcel');
     }
   }, []);
 
-  const handleCapitalJump = (city: CapitalJumpCity) => {
-    const fc = createRectPolygonFeatureCollection(city.lat, city.lng, 160, 140);
+  const handleParcelSnapAtPoint = useCallback(
+    async (lat: number, lng: number, explicitState?: AustralianState) => {
+      setParcelSnapLoading(true);
+      setParcelSnapNotice(null);
+      setLastRlvOpt(null);
+      try {
+        const res = await snapLegalParcelAtPoint(lat, lng, explicitState);
+        if (res.matched && res.featureCollection) {
+          setCustomBoundary(res.featureCollection);
+          setCustomStateCode(res.state);
+          setFinInputs((prev) =>
+            createDefaultDealFinancialInputs(res.state, prev.typology),
+          );
+          setActiveParcelId(res.parcelId);
+          setActiveParcelProvenance(
+            res.provenance === 'live-state-cadastre'
+              ? `Live ${res.state} Cadastre (${res.authority})`
+              : `Screening Footprint (${res.authority})`,
+          );
+          const label = res.address
+            ? `${res.parcelLabel} — ${res.address}`
+            : `${res.parcelLabel} (${res.state})`;
+          setCustomSiteLabel(label);
+          setSiteNameDraft(label);
+          setActiveDealId(null);
+          setCustomDemState(null);
+          setCustomTransect(null);
+          setVolumeMode('dem');
+          setRetainingOverrideStr(null);
+          setShowCadastre(true);
+          triggerFlyTo(lng, lat, 16.4);
+          setParcelSnapNotice({
+            kind: 'success',
+            text: `Snapped ${res.parcelId} (${(res.areaSqm / 10000).toFixed(2)} ha • ${res.authority}${res.zoneName ? ` • ${res.zoneName}` : ''})`,
+          });
+          notify(
+            `Legal ${res.state} Parcel Snapped`,
+            `${res.parcelId} • ${res.authority}`,
+            'success',
+          );
+        } else {
+          // Graceful fallback: place a clean screening boundary & offer Retry or manual draw
+          const fallbackFc = createRectPolygonFeatureCollection(lat, lng, 140, 120);
+          setCustomBoundary(fallbackFc);
+          setCustomStateCode(res.state);
+          setFinInputs((prev) =>
+            createDefaultDealFinancialInputs(res.state, prev.typology),
+          );
+          setActiveParcelId('');
+          setActiveParcelProvenance(`Screening Envelope (${res.authority})`);
+          const label = `${AU_STATE_SPATIAL_REGISTRY[res.state].capitalLabel} Area Screening Site (${res.state})`;
+          setCustomSiteLabel(label);
+          setSiteNameDraft(label);
+          setActiveDealId(null);
+          setCustomDemState(null);
+          setCustomTransect(null);
+          setVolumeMode('dem');
+          setShowCadastre(true);
+          triggerFlyTo(lng, lat, 16.0);
+          setParcelSnapNotice({
+            kind: res.upstreamUnavailable ? 'error' : 'warning',
+            text:
+              res.message ||
+              `Placed a calibrated screening parcel in ${res.state}. Trace exact lot boundaries with Polygon or Retry.`,
+            retryCoords: { lat, lng },
+          });
+        }
+      } finally {
+        setParcelSnapLoading(false);
+      }
+    },
+    [notify, triggerFlyTo],
+  );
+
+  const handleLocateMySite = useCallback(() => {
+    if (typeof navigator === 'undefined' || !navigator.geolocation) {
+      setParcelSnapNotice({
+        kind: 'warning',
+        text: 'GPS location is not available in this browser. Search any Australian address or tap a parcel on the map.',
+      });
+      return;
+    }
+    setGpsLoading(true);
+    setParcelSnapNotice(null);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setGpsLoading(false);
+        const { latitude, longitude } = pos.coords;
+        if (!isWithinAustraliaBounds(latitude, longitude)) {
+          setParcelSnapNotice({
+            kind: 'warning',
+            text: 'Your GPS position is outside Australia. Select any of the 8 Australian states or search an Australian address.',
+          });
+          return;
+        }
+        setViewportMode('map');
+        void handleParcelSnapAtPoint(latitude, longitude);
+      },
+      () => {
+        setGpsLoading(false);
+        setParcelSnapNotice({
+          kind: 'warning',
+          text: 'Location permission was declined or timed out. Search an address or use 1-Tap Parcel Snap directly on the map.',
+        });
+      },
+      { enableHighAccuracy: true, timeout: 9000, maximumAge: 30000 },
+    );
+  }, [handleParcelSnapAtPoint]);
+
+  const handleCapitalJump = (profile: AuStateSpatialProfile) => {
+    const fc = createRectPolygonFeatureCollection(
+      profile.capitalLat,
+      profile.capitalLng,
+      160,
+      140,
+    );
     setCustomBoundary(fc);
-    setCustomStateCode(city.state);
-    setCustomSiteLabel(`${city.label} CBD Screening Parcel`);
+    setCustomStateCode(profile.state);
+    setFinInputs((prev) =>
+      createDefaultDealFinancialInputs(profile.state, prev.typology),
+    );
+    const label = `${profile.capitalLabel} Precinct (${profile.state})`;
+    setCustomSiteLabel(label);
+    setSiteNameDraft(label);
+    setActiveDealId(null);
+    setActiveParcelId('');
+    setActiveParcelProvenance(`Screening Precinct (${profile.authority})`);
     setCustomDemState(null);
     setCustomTransect(null);
     setVolumeMode('dem');
     setRetainingOverrideStr(null);
     setOptFeedback(null);
+    setLastRlvOpt(null);
+    setParcelSnapNotice(null);
     setSearchResults([]);
     setSearchError(null);
     setViewportMode('map');
-    triggerFlyTo(city.lng, city.lat, 15.5);
+    triggerFlyTo(profile.capitalLng, profile.capitalLat, 15.5);
+  };
+
+  const handleOptimizeForMaxRlv = () => {
+    if (optimizingRlv) return;
+    setOptimizingRlv(true);
+    try {
+      const polyFc = activeBoundary as FeatureCollection<Polygon>;
+      const opt = optimizeGradingForMaxRlv({
+        grid: activeDemGrid,
+        boundary: polyFc,
+        state: activeState,
+        grossAreaSqm: effectiveResult.insideAreaSqm,
+        hydrology,
+        soilClass,
+        rockBreakoutPct,
+        topsoilDepthM: topsoilDepthMm / 1000,
+        targetCutFillRatio: targetCutFillRatio ?? 1.1,
+        maxGradePct,
+        terraceStepM,
+        ratesOverride: customRates,
+        env: envConstraints,
+        fin: finInputs,
+      });
+      setGradingStrategy(opt.bestStrategy);
+      setFflInputStr(opt.bestFflAHD.toFixed(2));
+      setVolumeMode('dem');
+      setLastRlvOpt(opt);
+      notify(
+        'Max RLV Grading Applied',
+        `${opt.bestStrategy} @ ${opt.bestFflAHD.toFixed(2)}m AHD (+${formatCompactAud(opt.rlvUpliftAud)} RLV)`,
+        'success',
+      );
+    } finally {
+      setOptimizingRlv(false);
+    }
+  };
+
+  const handleSaveDeal = async () => {
+    if (saveBusy) return;
+    if (!session) {
+      setVaultOpen(true);
+      return;
+    }
+    setSaveBusy(true);
+    setSaveFeedback(null);
+    try {
+      const polyFc = activeBoundary as FeatureCollection<Polygon>;
+      const res = await savePrivateDeal(session, {
+        existingId: activeDealId ?? undefined,
+        name: siteNameDraft,
+        state: activeState,
+        address: customSiteLabel ?? project.location.address ?? '',
+        parcelId: activeParcelId,
+        lat: activeSiteLat,
+        lng: activeSiteLng,
+        grossAreaSqm: effectiveResult.insideAreaSqm,
+        earthworksCostAud: effectiveResult.totalPackageAud,
+        rlvAud: dealIntelligence.residualLandValueAud,
+        developabilityScore: effectiveResult.developability.score,
+        gradingStrategy,
+        targetFflAHD: effectiveResult.targetFflAHD,
+        targetCutFillRatio: targetCutFillRatio ?? 1.1,
+        soilClass,
+        rockBreakoutPct,
+        topsoilDepthM: topsoilDepthMm / 1000,
+        ratesOverride: customRates,
+        env: envConstraints,
+        fin: finInputs,
+        boundary: polyFc,
+      });
+      if (!res.ok) {
+        setSaveFeedback({ kind: 'error', text: res.error });
+        return;
+      }
+      setActiveDealId(res.deal.id);
+      setCustomSiteLabel(res.deal.name);
+      if (typeof window !== 'undefined' && isStandalone) {
+        window.history.replaceState(
+          null,
+          '',
+          `#deal=${encodeURIComponent(res.deal.id)}&tab=${inspectorTab}`,
+        );
+      }
+      setSaveFeedback({
+        kind: 'success',
+        text: `Saved "${res.deal.name}" (${res.deal.state}) to your private workspace.`,
+      });
+      await refreshSavedDeals(session);
+    } finally {
+      setSaveBusy(false);
+    }
   };
 
   const handleAddressSearch = async (evt: FormEvent) => {
     evt.preventDefault();
     const q = searchQuery.trim();
-    if (!q) return;
+    if (!q) {
+      setSearchError('Enter an Australian street address, suburb, postcode, or lat, lng.');
+      return;
+    }
+    if (!/[A-Za-z0-9]/.test(q)) {
+      setSearchError('Please enter a valid Australian address or numeric coordinates.');
+      setSearchResults([]);
+      return;
+    }
     setSearchError(null);
 
     // Direct lat, lng support
     const directCoords = parseLatLngQuery(q);
     if (directCoords) {
       const st = inferAuStateFromLngLat(directCoords.lng, directCoords.lat);
-      const fc = createRectPolygonFeatureCollection(
-        directCoords.lat,
-        directCoords.lng,
-        150,
-        130,
-      );
-      setCustomBoundary(fc);
-      setCustomStateCode(st);
-      setCustomSiteLabel(
-        `Site ${directCoords.lat.toFixed(4)}, ${directCoords.lng.toFixed(4)}`,
-      );
-      setCustomDemState(null);
-      setCustomTransect(null);
-      setVolumeMode('dem');
       setSearchResults([]);
       setViewportMode('map');
-      triggerFlyTo(directCoords.lng, directCoords.lat, 15.5);
+      void handleParcelSnapAtPoint(directCoords.lat, directCoords.lng, st);
       return;
     }
 
@@ -1174,18 +1600,10 @@ function CutSheetWorkbench({
   };
 
   const handleSelectAddress = (addr: AuGeocodedAddress) => {
-    const fc = createRectPolygonFeatureCollection(addr.lat, addr.lng, 160, 140);
-    setCustomBoundary(fc);
-    setCustomStateCode(addr.state);
-    setCustomSiteLabel(addr.label);
-    setCustomDemState(null);
-    setCustomTransect(null);
-    setVolumeMode('dem');
-    setRetainingOverrideStr(null);
     setSearchResults([]);
     setSearchQuery(addr.label);
     setViewportMode('map');
-    triggerFlyTo(addr.lng, addr.lat, 15.5);
+    void handleParcelSnapAtPoint(addr.lat, addr.lng, addr.state);
   };
 
   const handleFetchTerrarium = async () => {
@@ -1306,6 +1724,12 @@ function CutSheetWorkbench({
     setCustomBoundary(null);
     setCustomSiteLabel(null);
     setCustomStateCode(null);
+    setSiteNameDraft(project.name);
+    setActiveDealId(null);
+    setActiveParcelId(project.geometry.parcelId ?? '');
+    setActiveParcelProvenance(`Workspace Parcel (${project.location.state})`);
+    setParcelSnapNotice(null);
+    setLastRlvOpt(null);
     setCustomDemState(null);
     setCustomTransect(null);
     setDemError(null);
@@ -1370,7 +1794,7 @@ function CutSheetWorkbench({
       }
       setShareCopied(true);
       window.setTimeout(() => setShareCopied(false), 2000);
-      notify('Shareable CutSheet link copied', 'Parcel & grading parameters encoded in URL hash', 'info');
+      notify('Shareable Map Lab. DA link copied', 'Parcel & grading parameters encoded in URL hash', 'info');
     } catch {
       setShareCopied(true);
       window.setTimeout(() => setShareCopied(false), 2000);
@@ -1389,6 +1813,7 @@ function CutSheetWorkbench({
     setCutSwellFactor(spec.defaultSwell);
     setFillCompactionFactor(spec.defaultCompaction);
     setCustomRates({});
+    setRateInputError(null);
   };
 
   const handleCutManualChange = (valStr: string) => {
@@ -1464,8 +1889,14 @@ function CutSheetWorkbench({
     const baseName = customSiteLabel ?? project.name;
     try {
       if (format === 'pdf') {
-        const blob = buildCutSheetPdfBlob(project, effectiveResult, hydrology);
-        const name = slugifyFilename(`${baseName}-cutsheet-report`, 'pdf');
+        const blob = buildCutSheetPdfBlob(
+          project,
+          effectiveResult,
+          hydrology,
+          dealIntelligence,
+          combinedProvenanceLabel,
+        );
+        const name = slugifyFilename(`${baseName}-map-lab-da-memo`, 'pdf');
         downloadBlobFile(blob, name);
         setExportFeedback(`Exported ${name}`);
       } else if (format === 'csv') {
@@ -1516,13 +1947,13 @@ function CutSheetWorkbench({
     retainingOverrideStr ?? String(Math.round(gridResult.retainingWallLengthM));
 
   const activeSoilSpec = SOIL_RATES_AUD[soilClass];
+  const activeStateProfile = AU_STATE_SPATIAL_REGISTRY[activeState];
   const basemapLabel =
     basemapMode === 'satellite'
       ? 'Satellite'
       : basemapMode === 'dark-vector'
         ? 'Dark Map'
         : 'Offline Grid';
-  const hasStateCadastre = Boolean(getPublicCadastreLayerForState(activeState));
   const grossHa = effectiveResult.insideAreaSqm / 10_000;
   const devRiskStyle =
     effectiveResult.developability.riskLevel === 'Low Risk'
@@ -1544,18 +1975,25 @@ function CutSheetWorkbench({
       id="workbench-body"
       className="@container flex min-h-0 w-full flex-1 flex-col bg-[#0a0f16] text-slate-100"
     >
-      {/* 1. TOP COMMAND BAR (Pro GIS Workstation Header — @container responsive) */}
+      {/* 1. TOP COMMAND BAR (Map Lab. DA Commercial GIS Workstation Header — @container responsive) */}
       <header className="relative z-30 flex shrink-0 flex-wrap items-center justify-between gap-x-2 gap-y-1.5 border-b border-slate-400/14 bg-[#0d131c] px-2.5 py-1.5">
-        {/* Left: Brand, Active Site Identity & Mandatory E2E Telemetry Badges */}
+        {/* Left: Map Lab. DA Brand, Active Site Identity & Mandatory E2E Telemetry Badges */}
         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-          <span className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-[#3daee9]/40 bg-[#3daee9]/15 text-[#3daee9]">
-            <Mountain size={13} />
+          <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-[#3daee9]/45 bg-[#3daee9]/15 text-[#3daee9]">
+            <Compass size={14} />
           </span>
+          <span
+            data-testid="maplab-brand-wordmark"
+            className="shrink-0 text-xs font-extrabold tracking-tight text-white"
+          >
+            Map Lab. <span className="text-[#3daee9]">DA</span>
+          </span>
+          <span className="hidden h-3.5 w-px bg-slate-600/40 sm:inline-block" />
           <div className="flex min-w-0 flex-wrap items-center gap-1.5">
             <h1
               id="site-name"
               title={customSiteLabel ?? project.name}
-              className="max-w-[140px] truncate text-xs font-bold tracking-tight text-white @[1120px]:max-w-[200px]"
+              className="max-w-[130px] truncate text-[11px] font-semibold tracking-tight text-slate-200 @[1120px]:max-w-[180px]"
             >
               {customSiteLabel ?? project.name}
             </h1>
@@ -1571,6 +2009,15 @@ function CutSheetWorkbench({
             >
               {activeMga.mgaEpsg}
             </span>
+            {activeParcelId && (
+              <span
+                data-testid="maplab-parcel-id-badge"
+                title={`Legal Parcel ID: ${activeParcelId}`}
+                className="font-mono-tech hidden max-w-[130px] shrink-0 truncate rounded border border-emerald-400/35 bg-emerald-500/12 px-1.5 py-0.5 text-[9.5px] font-semibold text-emerald-200 @[900px]:inline-flex"
+              >
+                {activeParcelId}
+              </span>
+            )}
             <span
               id="render-loop-badge"
               data-testid="render-loop-badge"
@@ -1589,13 +2036,13 @@ function CutSheetWorkbench({
           </div>
         </div>
 
-        {/* Center: AU Address / Lat-Lng Search + Capital City Quick Jumps */}
+        {/* Center: AU Address / Lat-Lng Search + 1-Tap GPS + Universal 8-State Quick Jumps */}
         <div className="relative flex min-w-0 basis-full items-center gap-1.5 @[620px]:basis-auto @[620px]:flex-1 @[620px]:justify-center">
           <form
             onSubmit={(e) => void handleAddressSearch(e)}
-            className="flex min-w-0 flex-1 items-center rounded-md border border-slate-400/20 bg-[#080d14] px-2 py-0.5 focus-within:border-[#3daee9]/65 @[620px]:max-w-[260px]"
+            className="flex min-w-0 flex-1 items-center rounded-md border border-slate-400/20 bg-[#080d14] px-2 py-1 focus-within:border-[#3daee9]/65 @[620px]:max-w-[240px]"
           >
-            <Search size={11} className="mr-1.5 shrink-0 text-slate-400" />
+            <Search size={12} className="mr-1.5 shrink-0 text-slate-400" />
             <input
               type="text"
               data-testid="cutsheet-address-search"
@@ -1608,32 +2055,76 @@ function CutSheetWorkbench({
             <button
               type="submit"
               disabled={searchLoading}
-              className="ml-1 shrink-0 cursor-pointer rounded bg-[#182332] px-1.5 py-0.5 text-[10px] font-semibold text-sky-200 hover:bg-[#3daee9] hover:text-slate-950 disabled:opacity-50"
+              className="ml-1 shrink-0 cursor-pointer rounded bg-[#182332] px-2 py-0.5 text-[10px] font-semibold text-sky-200 hover:bg-[#3daee9] hover:text-slate-950 disabled:opacity-50"
             >
               {searchLoading ? <Loader2 size={10} className="animate-spin" /> : 'Go'}
             </button>
           </form>
 
-          {/* Capital City Quick Jumps (shown only when CutSheet container >= 1120px) */}
-          <div className="hidden items-center gap-0.5 rounded-md border border-slate-400/15 bg-[#080d14] p-0.5 @[1120px]:flex">
-            {CAPITAL_CITIES.map((city) => (
+          {/* 1-Tap GPS Locate My Site */}
+          <button
+            type="button"
+            data-testid="maplab-gps-btn"
+            disabled={gpsLoading}
+            onClick={handleLocateMySite}
+            title="Locate My Site (GPS + Auto Legal Parcel Snap)"
+            aria-label="Locate My Site using GPS"
+            className="inline-flex h-8 shrink-0 cursor-pointer items-center gap-1 rounded-md border border-slate-400/22 bg-[#141d2a] px-2 text-[10.5px] font-semibold text-sky-200 transition-colors hover:border-[#3daee9]/60 hover:text-white disabled:opacity-50"
+          >
+            {gpsLoading ? (
+              <Loader2 size={12} className="animate-spin text-[#3daee9]" />
+            ) : (
+              <LocateFixed size={12} className="text-[#3daee9]" />
+            )}
+            <span className="hidden @[820px]:inline">GPS</span>
+          </button>
+
+          {/* Compact 8-State Quick-Jump Select (Mobile / Tablet / Narrow Window < 1180px) */}
+          <select
+            aria-label="Jump to any Australian state or territory"
+            data-testid="maplab-state-select"
+            value={activeState}
+            onChange={(e) => {
+              const target = ALL_8_AU_CAPITALS.find((c) => c.state === e.target.value);
+              if (target) handleCapitalJump(target);
+            }}
+            className="font-mono-tech h-8 shrink-0 cursor-pointer rounded-md border border-slate-400/22 bg-[#080d14] px-1.5 text-[10.5px] font-semibold text-sky-200 focus:border-[#3daee9] focus:outline-none @[1180px]:hidden"
+          >
+            {ALL_8_AU_CAPITALS.map((city) => (
+              <option key={city.state} value={city.state}>
+                {city.state} · {city.capitalLabel}
+              </option>
+            ))}
+          </select>
+
+          {/* All 8 Australian Capitals Quick-Jump Bar (Desktop >= 1180px) */}
+          <div className="hidden items-center gap-0.5 rounded-md border border-slate-400/15 bg-[#080d14] p-0.5 @[1180px]:flex">
+            {ALL_8_AU_CAPITALS.map((city) => (
               <button
-                key={city.code}
+                key={city.state}
                 type="button"
+                data-testid={`maplab-jump-${city.state.toLowerCase()}`}
                 onClick={() => handleCapitalJump(city)}
-                title={`Jump to ${city.label} (${city.state})`}
-                className="cursor-pointer whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-medium text-slate-300 transition-colors hover:bg-[#192638] hover:text-white"
+                title={`Jump to ${city.capitalLabel} (${city.state} • ${city.authority})`}
+                className={`cursor-pointer whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-semibold transition-colors ${
+                  activeState === city.state
+                    ? 'bg-[#3daee9]/20 text-sky-200'
+                    : 'text-slate-300 hover:bg-[#192638] hover:text-white'
+                }`}
               >
-                {city.label}
+                {city.state}
               </button>
             ))}
           </div>
 
           {/* Search dropdown results */}
           {(searchResults.length > 0 || searchError) && (
-            <div className="absolute top-full left-1/2 z-40 mt-1 w-72 -translate-x-1/2 rounded-lg border border-slate-400/25 bg-[#0f1723] p-1.5 shadow-2xl">
+            <div className="absolute top-full left-1/2 z-40 mt-1 w-72 max-w-[92vw] -translate-x-1/2 rounded-lg border border-slate-400/25 bg-[#0f1723] p-1.5 shadow-2xl">
               {searchError ? (
-                <div className="flex items-center justify-between gap-2 px-2 py-1 text-[11px] text-rose-200">
+                <div
+                  role="alert"
+                  className="flex items-center justify-between gap-2 px-2 py-1 text-[11px] text-rose-200"
+                >
                   <span>{searchError}</span>
                   <button
                     type="button"
@@ -1668,8 +2159,27 @@ function CutSheetWorkbench({
           )}
         </div>
 
-        {/* Right: Basemap, Share, 3D Map, 3D Studio */}
+        {/* Right: My Sites Cloud Vault, Basemap, Share, 3D Map, 3D Studio */}
         <div className="flex flex-wrap items-center gap-1">
+          <button
+            type="button"
+            data-testid="maplab-vault-btn"
+            onClick={() => setVaultOpen(true)}
+            title={
+              session
+                ? `My Saved Sites (${session.email})`
+                : 'Sign In to Save & Manage Private Sites'
+            }
+            className={`inline-flex cursor-pointer items-center gap-1 rounded-md border px-2 py-1 text-[10.5px] font-semibold transition-colors ${
+              session
+                ? 'border-emerald-400/40 bg-emerald-500/12 text-emerald-200 hover:bg-emerald-500/20'
+                : 'border-slate-400/25 bg-[#141d2a] text-slate-100 hover:border-[#3daee9]/55 hover:text-white'
+            }`}
+          >
+            {session ? <FolderOpen size={11} /> : <User size={11} className="text-[#3daee9]" />}
+            <span>{session ? `Sites (${savedDeals.length})` : 'Sign In'}</span>
+          </button>
+
           <button
             type="button"
             data-testid="cutsheet-basemap-btn"
@@ -1678,7 +2188,7 @@ function CutSheetWorkbench({
             className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-slate-400/20 bg-[#141d2a] px-2 py-1 text-[10.5px] font-medium text-slate-200 transition-colors hover:border-[#3daee9]/50 hover:text-white"
           >
             <Globe size={11} className="text-[#3daee9]" />
-            <span>{basemapLabel}</span>
+            <span className="hidden sm:inline">{basemapLabel}</span>
           </button>
 
           <button
@@ -1693,7 +2203,7 @@ function CutSheetWorkbench({
             ) : (
               <Share2 size={11} className="text-slate-300" />
             )}
-            <span className="hidden sm:inline">
+            <span className="hidden @[760px]:inline">
               {shareCopied ? 'Copied' : 'Share'}
             </span>
           </button>
@@ -1735,7 +2245,7 @@ function CutSheetWorkbench({
 
       {/* 2. MAIN WORKSTATION 3-ZONE BODY (CAD Rail | Full-Bleed Map/3D | Right Site Inspector) */}
       <div className="flex min-h-0 flex-1 flex-col min-[680px]:flex-row min-[680px]:overflow-hidden">
-        {/* ZONE A: VERTICAL CAD TOOL RAIL (Horizontal strip on <680px mobile) */}
+        {/* ZONE A: VERTICAL CAD TOOL RAIL (44x44px Thumb-Friendly Horizontal Strip on <680px mobile) */}
         <aside
           aria-label="CAD Terrain Tools"
           className="flex shrink-0 flex-row items-center justify-between gap-1 overflow-x-auto border-b border-slate-400/14 bg-[#0d131c] px-2 py-1.5 min-[680px]:w-[44px] min-[680px]:flex-col min-[680px]:justify-start min-[680px]:overflow-visible min-[680px]:border-r min-[680px]:border-b-0 min-[680px]:px-0 min-[680px]:py-2"
@@ -1748,31 +2258,33 @@ function CutSheetWorkbench({
                 setViewportMode('map');
                 setActiveTool('select');
               }}
-              className={`inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-md border transition-colors ${
+              className={`inline-flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center rounded-md border transition-colors min-[680px]:h-8 min-[680px]:w-8 ${
                 viewportMode === 'map' && activeTool === 'select'
                   ? 'border-[#3daee9]/65 bg-[#3daee9]/20 text-sky-200'
                   : 'border-transparent text-slate-400 hover:bg-[#172231] hover:text-white'
               }`}
             >
-              <MousePointer2 size={14} />
+              <MousePointer2 size={15} />
             </button>
 
             <button
               type="button"
-              title="1-Click Parcel Snap"
+              data-testid="maplab-parcel-snap-tool"
+              title="1-Tap Legal Parcel Snap (All 8 AU States)"
               onClick={() => {
                 setViewportMode('map');
+                setShowCadastre(true);
                 setActiveTool((t) =>
                   t === 'cadastre-snap' ? 'select' : 'cadastre-snap',
                 );
               }}
-              className={`inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-md border transition-colors ${
+              className={`inline-flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center rounded-md border transition-colors min-[680px]:h-8 min-[680px]:w-8 ${
                 activeTool === 'cadastre-snap'
-                  ? 'border-[#3daee9]/65 bg-[#3daee9]/20 text-sky-200'
+                  ? 'border-emerald-400/70 bg-emerald-500/20 text-emerald-200'
                   : 'border-transparent text-slate-400 hover:bg-[#172231] hover:text-white'
               }`}
             >
-              <Crosshair size={14} />
+              <Crosshair size={15} />
             </button>
 
             <button
@@ -1784,31 +2296,31 @@ function CutSheetWorkbench({
                   t === 'draw-polygon' ? 'select' : 'draw-polygon',
                 );
               }}
-              className={`inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-md border transition-colors ${
+              className={`inline-flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center rounded-md border transition-colors min-[680px]:h-8 min-[680px]:w-8 ${
                 activeTool === 'draw-polygon'
                   ? 'border-[#3daee9]/65 bg-[#3daee9]/20 text-sky-200'
                   : 'border-transparent text-slate-400 hover:bg-[#172231] hover:text-white'
               }`}
             >
-              <Pentagon size={14} />
+              <Pentagon size={15} />
             </button>
 
             <button
               type="button"
-              title="Draw Site Rectangle (2 clicks)"
+              title="Draw Site Rectangle (2 taps)"
               onClick={() => {
                 setViewportMode('map');
                 setActiveTool((t) =>
                   t === 'draw-rect' ? 'select' : 'draw-rect',
                 );
               }}
-              className={`inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-md border transition-colors ${
+              className={`inline-flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center rounded-md border transition-colors min-[680px]:h-8 min-[680px]:w-8 ${
                 activeTool === 'draw-rect'
                   ? 'border-[#3daee9]/65 bg-[#3daee9]/20 text-sky-200'
                   : 'border-transparent text-slate-400 hover:bg-[#172231] hover:text-white'
               }`}
             >
-              <Square size={14} />
+              <Square size={15} />
             </button>
 
             <button
@@ -1821,13 +2333,27 @@ function CutSheetWorkbench({
                   t === 'draw-section' ? 'select' : 'draw-section',
                 );
               }}
-              className={`inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-md border transition-colors ${
+              className={`inline-flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center rounded-md border transition-colors min-[680px]:h-8 min-[680px]:w-8 ${
                 activeTool === 'draw-section'
                   ? 'border-amber-400/65 bg-amber-500/20 text-amber-200'
                   : 'border-transparent text-slate-400 hover:bg-[#172231] hover:text-white'
               }`}
             >
-              <Activity size={14} />
+              <Activity size={15} />
+            </button>
+
+            <button
+              type="button"
+              data-testid="maplab-cadastre-toggle-btn"
+              title={`Toggle Live ${activeState} Cadastral Boundaries (${activeStateProfile.authority})`}
+              onClick={() => setShowCadastre((v) => !v)}
+              className={`inline-flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center rounded-md border transition-colors min-[680px]:h-8 min-[680px]:w-8 ${
+                showCadastre
+                  ? 'border-sky-400/65 bg-sky-500/20 text-sky-200'
+                  : 'border-transparent text-slate-400 hover:bg-[#172231] hover:text-white'
+              }`}
+            >
+              <Layers size={15} />
             </button>
 
             <div className="mx-1 h-5 w-px bg-slate-400/15 min-[680px]:mx-0 min-[680px]:my-1 min-[680px]:h-px min-[680px]:w-5" />
@@ -1838,20 +2364,20 @@ function CutSheetWorkbench({
               disabled={demLoading}
               onClick={() => void handleFetchTerrarium()}
               title="Analyse Site — Stream Live AWS Terrarium DEM"
-              className="inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-md border border-[#3daee9]/40 bg-[#3daee9]/15 text-sky-300 transition-colors hover:bg-[#3daee9] hover:text-slate-950 disabled:opacity-50"
+              className="inline-flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center rounded-md border border-[#3daee9]/40 bg-[#3daee9]/15 text-sky-300 transition-colors hover:bg-[#3daee9] hover:text-slate-950 disabled:opacity-50 min-[680px]:h-8 min-[680px]:w-8"
             >
               {demLoading ? (
-                <Loader2 size={14} className="animate-spin" />
+                <Loader2 size={15} className="animate-spin" />
               ) : (
-                <Play size={14} />
+                <Play size={15} />
               )}
             </button>
 
             <label
               title="Upload ELVIS 1m LiDAR GeoTIFF (.tif) or Survey CSV/XYZ"
-              className="inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-md border border-transparent text-slate-300 transition-colors hover:bg-[#172231] hover:text-white"
+              className="inline-flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center rounded-md border border-transparent text-slate-300 transition-colors hover:bg-[#172231] hover:text-white min-[680px]:h-8 min-[680px]:w-8"
             >
-              <Upload size={14} />
+              <Upload size={15} />
               <input
                 ref={fileInputRef}
                 type="file"
@@ -1867,9 +2393,9 @@ function CutSheetWorkbench({
               type="button"
               title="Reset to Active Workspace Parcel & Local DTM"
               onClick={handleResetWorkspaceParcel}
-              className="inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-md border border-transparent text-slate-400 transition-colors hover:bg-[#172231] hover:text-rose-300"
+              className="inline-flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center rounded-md border border-transparent text-slate-400 transition-colors hover:bg-[#172231] hover:text-rose-300 min-[680px]:h-8 min-[680px]:w-8"
             >
-              <RotateCcw size={13} />
+              <RotateCcw size={14} />
             </button>
           </div>
 
@@ -1877,23 +2403,70 @@ function CutSheetWorkbench({
             type="button"
             title={inspectorOpen ? 'Collapse Site Inspector' : 'Open Site Inspector'}
             onClick={() => setInspectorOpen((v) => !v)}
-            className="inline-flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-md border border-slate-400/15 text-slate-300 transition-colors hover:bg-[#172231] hover:text-white min-[680px]:mt-auto"
+            className="inline-flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center rounded-md border border-slate-400/15 text-slate-300 transition-colors hover:bg-[#172231] hover:text-white min-[680px]:mt-auto min-[680px]:h-8 min-[680px]:w-8"
           >
             {inspectorOpen ? (
-              <PanelRightClose size={14} />
+              <PanelRightClose size={15} />
             ) : (
-              <PanelRightOpen size={14} />
+              <PanelRightOpen size={15} />
             )}
           </button>
         </aside>
 
         {/* ZONE B: FULL-BLEED CENTER VIEWPORT (MapLibre 2D/3D Map or Three.js 3D Studio + Section Drawer) */}
-        <section className="relative flex min-h-[300px] min-w-0 flex-1 flex-col overflow-hidden bg-[#070b14]">
+        <section
+          className={`relative min-w-0 flex-1 flex-col overflow-hidden bg-[#070b14] ${
+            mobileSheetMode === 'inspector'
+              ? 'hidden min-[680px]:flex'
+              : mobileSheetMode === 'map'
+                ? 'flex min-h-[70vh] min-[680px]:min-h-[300px]'
+                : 'flex min-h-[320px] min-[680px]:min-h-[300px]'
+          }`}
+        >
           {/* DEM Loading Pill */}
           {demLoading && (
             <div className="pointer-events-none absolute bottom-10 left-1/2 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full border border-[#3daee9]/45 bg-[#0c1420]/95 px-3 py-1 text-[11px] font-medium text-sky-200 shadow-xl backdrop-blur">
               <Loader2 size={12} className="animate-spin text-[#3daee9]" />
               <span>{demLoadingLabel || 'Streaming elevation data...'}</span>
+            </div>
+          )}
+
+          {/* Live 8-State Parcel Snap / GPS Notice Banner */}
+          {parcelSnapNotice && (
+            <div
+              role={parcelSnapNotice.kind === 'error' ? 'alert' : 'status'}
+              data-testid="maplab-parcel-notice"
+              className={`z-30 flex items-center justify-between gap-2 border-b px-3 py-1.5 text-[11px] backdrop-blur ${
+                parcelSnapNotice.kind === 'success'
+                  ? 'border-emerald-400/35 bg-emerald-950/85 text-emerald-100'
+                  : parcelSnapNotice.kind === 'warning'
+                    ? 'border-amber-400/35 bg-amber-950/85 text-amber-100'
+                    : 'border-rose-500/40 bg-rose-950/90 text-rose-100'
+              }`}
+            >
+              <span className="min-w-0 flex-1 truncate">{parcelSnapNotice.text}</span>
+              <div className="flex shrink-0 items-center gap-1.5">
+                {parcelSnapNotice.retryCoords && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const coords = parcelSnapNotice.retryCoords;
+                      if (coords) void handleParcelSnapAtPoint(coords.lat, coords.lng);
+                    }}
+                    className="cursor-pointer rounded border border-current/35 bg-white/10 px-2 py-0.5 text-[10px] font-semibold hover:bg-white/20"
+                  >
+                    Retry
+                  </button>
+                )}
+                <button
+                  type="button"
+                  aria-label="Dismiss parcel notice"
+                  onClick={() => setParcelSnapNotice(null)}
+                  className="cursor-pointer opacity-75 hover:opacity-100"
+                >
+                  <X size={12} />
+                </button>
+              </div>
             </div>
           )}
 
@@ -1971,6 +2544,10 @@ function CutSheetWorkbench({
                 activeTool={activeTool}
                 onToolChange={setActiveTool}
                 onBoundaryDrawn={handleBoundaryDrawn}
+                onParcelSnapRequest={(lat, lng) =>
+                  void handleParcelSnapAtPoint(lat, lng)
+                }
+                parcelSnapLoading={parcelSnapLoading}
                 sectionStart={sectionStart}
                 sectionEnd={sectionEnd}
                 onSectionLineChange={(start, end) => {
@@ -2001,6 +2578,20 @@ function CutSheetWorkbench({
                 onShowFflPlaneChange={setShowFflPlane}
                 fullBleed={true}
               />
+            )}
+
+            {/* Mobile Full-Map Restore Sheet Pill (<680px only) */}
+            {mobileSheetMode === 'map' && (
+              <button
+                type="button"
+                onClick={() => setMobileSheetMode('split')}
+                className="absolute bottom-3 left-1/2 z-30 inline-flex min-h-[40px] -translate-x-1/2 cursor-pointer items-center gap-1.5 rounded-full border border-[#3daee9]/70 bg-[#0d141f]/95 px-4 py-1.5 text-xs font-bold text-sky-200 shadow-2xl backdrop-blur min-[680px]:hidden"
+              >
+                <ChevronUp size={14} />
+                <span>
+                  Deal &amp; RLV · {formatCompactAud(dealIntelligence.residualLandValueAud)}
+                </span>
+              </button>
             )}
 
             {/* Floating Bottom-Right Quick Section Toggle Pill */}
@@ -2035,64 +2626,84 @@ function CutSheetWorkbench({
           )}
         </section>
 
-        {/* ZONE C: DOCKED RIGHT SITE INSPECTOR (3 Tabs: Terrain | Plan & Flow | Cut & Cost) */}
+        {/* ZONE C: DOCKED RIGHT SITE INSPECTOR (4 Tabs: Deal & RLV | Cut & Cost | Terrain | Plan & Flow) */}
         {inspectorOpen && (
           <aside
             aria-label="Site Inspector"
-            className="flex w-full shrink-0 flex-col border-t border-slate-400/14 bg-[#0d131c] @[680px]:w-[300px] @[680px]:border-t-0 @[680px]:border-l @[1024px]:w-[348px]"
+            className={`w-full shrink-0 flex-col border-t border-slate-400/14 bg-[#0d131c] @[680px]:w-[320px] @[680px]:border-t-0 @[680px]:border-l @[1024px]:w-[368px] ${
+              mobileSheetMode === 'map' ? 'hidden min-[680px]:flex' : 'flex'
+            }`}
           >
-            {/* Inspector Header */}
+            {/* Inspector Header + Live RLV Pill + Mobile Sheet Switcher */}
             <div className="flex shrink-0 items-center justify-between gap-2 border-b border-slate-400/12 px-3 py-2">
               <div className="min-w-0">
                 <div className="truncate text-[10.5px] font-bold tracking-wider text-slate-200 uppercase">
-                  {customBoundary ? 'Drawn Site Parcel' : 'Site Inspector'}
+                  {activeParcelId
+                    ? `Parcel ${activeParcelId}`
+                    : customBoundary
+                      ? 'Active Site Parcel'
+                      : 'Site Inspector'}
                 </div>
                 <div className="font-mono-tech text-[10px] text-slate-400">
-                  {grossHa.toFixed(2)} ha • {activeMga.mgaEpsg} • Mean{' '}
+                  {grossHa.toFixed(2)} ha • {activeMga.mgaEpsg} •{' '}
                   {activeDemGrid.meanAHD.toFixed(1)}m AHD
                 </div>
               </div>
-              <span className="font-mono-tech shrink-0 rounded border border-[#3daee9]/35 bg-[#3daee9]/12 px-1.5 py-0.5 text-[10px] font-semibold text-sky-300">
-                {activeDemGrid.cols}×{activeDemGrid.rows}
-              </span>
+              <div className="flex shrink-0 items-center gap-1">
+                <span
+                  data-testid="maplab-header-rlv-pill"
+                  title="Estimated Max Land Offer (Residual Land Value)"
+                  className="font-mono-tech rounded border border-emerald-400/35 bg-emerald-500/12 px-1.5 py-0.5 text-[10px] font-bold text-emerald-300"
+                >
+                  RLV {formatCompactAud(dealIntelligence.residualLandValueAud)}
+                </span>
+                {/* Mobile Sheet Height Mode (<680px only) */}
+                <div className="inline-flex rounded border border-slate-400/20 bg-[#080d14] p-0.5 text-[9.5px] min-[680px]:hidden">
+                  {(
+                    [
+                      { id: 'map', label: 'Map' },
+                      { id: 'split', label: 'Split' },
+                      { id: 'inspector', label: 'Panel' },
+                    ] as const
+                  ).map((m) => (
+                    <button
+                      key={m.id}
+                      type="button"
+                      data-testid={`maplab-mobile-sheet-${m.id}`}
+                      onClick={() => setMobileSheetMode(m.id)}
+                      className={`cursor-pointer rounded px-1.5 py-0.5 font-semibold ${
+                        mobileSheetMode === m.id
+                          ? 'bg-[#3daee9] text-slate-950'
+                          : 'text-slate-400'
+                      }`}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
             </div>
 
-            {/* 3-Tab Switcher (Terrain | Plan & Flow | Cut & Cost) */}
+            {/* 4-Tab Switcher (Deal & RLV | Cut & Cost | Terrain | Plan & Flow) */}
             <div
               role="tablist"
               aria-label="Site Inspector Tabs"
-              className="grid shrink-0 grid-cols-3 gap-1 border-b border-slate-400/12 bg-[#0a0f17] p-1.5"
+              className="grid shrink-0 grid-cols-4 gap-1 border-b border-slate-400/12 bg-[#0a0f17] p-1.5"
             >
               <button
                 type="button"
                 role="tab"
-                aria-selected={inspectorTab === 'terrain'}
-                data-testid="cutsheet-tab-terrain"
-                onClick={() => setInspectorTab('terrain')}
-                className={`inline-flex cursor-pointer items-center justify-center gap-1 rounded-md px-2 py-1.5 text-[11px] font-semibold transition-colors ${
-                  inspectorTab === 'terrain'
-                    ? 'border border-[#3daee9]/50 bg-[#142235] text-sky-200'
+                aria-selected={inspectorTab === 'deal-rlv'}
+                data-testid="maplab-tab-deal-rlv"
+                onClick={() => handleSelectInspectorTab('deal-rlv')}
+                className={`inline-flex cursor-pointer items-center justify-center gap-1 rounded-md px-1.5 py-1.5 text-[10.5px] font-semibold transition-colors ${
+                  inspectorTab === 'deal-rlv'
+                    ? 'border border-emerald-400/50 bg-emerald-500/15 text-emerald-200'
                     : 'border border-transparent text-slate-400 hover:bg-[#121a26] hover:text-slate-200'
                 }`}
               >
-                <Mountain size={12} />
-                <span>Terrain</span>
-              </button>
-
-              <button
-                type="button"
-                role="tab"
-                aria-selected={inspectorTab === 'plan-flow'}
-                data-testid="cutsheet-tab-planflow"
-                onClick={() => setInspectorTab('plan-flow')}
-                className={`inline-flex cursor-pointer items-center justify-center gap-1 rounded-md px-2 py-1.5 text-[11px] font-semibold transition-colors ${
-                  inspectorTab === 'plan-flow'
-                    ? 'border border-[#3daee9]/50 bg-[#142235] text-sky-200'
-                    : 'border border-transparent text-slate-400 hover:bg-[#121a26] hover:text-slate-200'
-                }`}
-              >
-                <Droplets size={12} />
-                <span>Plan &amp; Flow</span>
+                <Landmark size={11} />
+                <span className="truncate">Deal</span>
               </button>
 
               <button
@@ -2100,20 +2711,74 @@ function CutSheetWorkbench({
                 role="tab"
                 aria-selected={inspectorTab === 'cut-cost'}
                 data-testid="cutsheet-tab-cutcost"
-                onClick={() => setInspectorTab('cut-cost')}
-                className={`inline-flex cursor-pointer items-center justify-center gap-1 rounded-md px-2 py-1.5 text-[11px] font-semibold transition-colors ${
+                onClick={() => handleSelectInspectorTab('cut-cost')}
+                className={`inline-flex cursor-pointer items-center justify-center gap-1 rounded-md px-1.5 py-1.5 text-[10.5px] font-semibold transition-colors ${
                   inspectorTab === 'cut-cost'
                     ? 'border border-[#3daee9]/50 bg-[#142235] text-sky-200'
                     : 'border border-transparent text-slate-400 hover:bg-[#121a26] hover:text-slate-200'
                 }`}
               >
-                <SlidersHorizontal size={12} />
-                <span>Cut &amp; Cost</span>
+                <SlidersHorizontal size={11} />
+                <span className="truncate">Cut/Cost</span>
+              </button>
+
+              <button
+                type="button"
+                role="tab"
+                aria-selected={inspectorTab === 'terrain'}
+                data-testid="cutsheet-tab-terrain"
+                onClick={() => handleSelectInspectorTab('terrain')}
+                className={`inline-flex cursor-pointer items-center justify-center gap-1 rounded-md px-1.5 py-1.5 text-[10.5px] font-semibold transition-colors ${
+                  inspectorTab === 'terrain'
+                    ? 'border border-[#3daee9]/50 bg-[#142235] text-sky-200'
+                    : 'border border-transparent text-slate-400 hover:bg-[#121a26] hover:text-slate-200'
+                }`}
+              >
+                <Mountain size={11} />
+                <span className="truncate">Terrain</span>
+              </button>
+
+              <button
+                type="button"
+                role="tab"
+                aria-selected={inspectorTab === 'plan-flow'}
+                data-testid="cutsheet-tab-planflow"
+                onClick={() => handleSelectInspectorTab('plan-flow')}
+                className={`inline-flex cursor-pointer items-center justify-center gap-1 rounded-md px-1.5 py-1.5 text-[10.5px] font-semibold transition-colors ${
+                  inspectorTab === 'plan-flow'
+                    ? 'border border-[#3daee9]/50 bg-[#142235] text-sky-200'
+                    : 'border border-transparent text-slate-400 hover:bg-[#121a26] hover:text-slate-200'
+                }`}
+              >
+                <Droplets size={11} />
+                <span className="truncate">Flow</span>
               </button>
             </div>
 
             {/* Scrollable Inspector Body */}
             <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3">
+              {/* ================= TAB 0: DEAL & RLV (PADDOCK-TO-OFFER INTELLIGENCE) ================= */}
+              {inspectorTab === 'deal-rlv' && (
+                <DealIntelligencePanel
+                  intelligence={dealIntelligence}
+                  fin={finInputs}
+                  onFinChange={setFinInputs}
+                  siteNameDraft={siteNameDraft}
+                  onSiteNameDraftChange={setSiteNameDraft}
+                  session={session}
+                  onOpenAuthVault={() => setVaultOpen(true)}
+                  onSaveDeal={handleSaveDeal}
+                  saveBusy={saveBusy}
+                  saveFeedback={saveFeedback}
+                  onOptimizeForMaxRlv={handleOptimizeForMaxRlv}
+                  optimizingRlv={optimizingRlv}
+                  lastOptimization={lastRlvOpt}
+                  onExportPdfMemo={() => handleExport('pdf')}
+                  parcelProvenanceLabel={combinedProvenanceLabel}
+                  parcelId={activeParcelId || undefined}
+                />
+              )}
+
               {/* ================= TAB 1: TERRAIN ================= */}
               {inspectorTab === 'terrain' && (
                 <div
@@ -2330,17 +2995,18 @@ function CutSheetWorkbench({
                     </button>
                   </div>
 
-                  {hasStateCadastre && (
-                    <label className="flex cursor-pointer items-center justify-between rounded-lg border border-slate-400/14 bg-[#111824] px-2.5 py-2 text-[11px] text-slate-200">
-                      <span>{activeState} Public Cadastre Overlay</span>
-                      <input
-                        type="checkbox"
-                        checked={showCadastre}
-                        onChange={(e) => setShowCadastre(e.target.checked)}
-                        className="accent-[#3daee9]"
-                      />
-                    </label>
-                  )}
+                  <label className="flex cursor-pointer items-center justify-between gap-2 rounded-lg border border-slate-400/14 bg-[#111824] px-2.5 py-2 text-[11px] text-slate-200">
+                    <span className="min-w-0 truncate">
+                      {activeState} Live Cadastre ({activeStateProfile.authority})
+                    </span>
+                    <input
+                      type="checkbox"
+                      data-testid="maplab-terrain-cadastre-checkbox"
+                      checked={showCadastre}
+                      onChange={(e) => setShowCadastre(e.target.checked)}
+                      className="shrink-0 accent-[#3daee9]"
+                    />
+                  </label>
 
                   {/* CRS & DTM Telemetry */}
                   <div className="space-y-1 rounded-lg border border-slate-400/12 bg-[#0a0f17] px-2.5 py-2 font-mono-tech text-[10px] text-slate-400">
@@ -2367,30 +3033,34 @@ function CutSheetWorkbench({
                 </div>
               )}
 
-              {/* ================= TAB 2: PLAN & FLOW ================= */}
+              {/* ================= TAB 2: PLAN & FLOW (UNIFIED TRUE NDA + ENVIROSIM + OSD + D8) ================= */}
               {inspectorTab === 'plan-flow' && (
                 <div
                   data-testid="cutsheet-inspector-planflow"
                   className="flex flex-col gap-3"
                 >
-                  {/* Planning & NDA Card */}
+                  {/* Unified True NDA Card */}
                   <div className="rounded-lg border border-slate-400/14 bg-[#111824] p-2.5">
                     <div className="flex items-center gap-1.5 text-[10.5px] font-bold tracking-wider text-sky-300 uppercase">
                       <Layers size={12} />
-                      <span>Planning &amp; NDA ({activeState})</span>
+                      <span>Unified True NDA ({activeState})</span>
                     </div>
                     <p className="mt-1 text-[10.5px] leading-relaxed text-slate-400">
-                      {STATE_PLANNING_AUTHORITY[activeState]} — NDA derived from
-                      GDA2020 Horn slope (&gt;15%) &amp; D8 drainage channels.
+                      {STATE_PLANNING_AUTHORITY[activeState]} — fuses Horn slope
+                      (&gt;15%), D8 channels, EnviroSim constraints &amp; OSD basin
+                      footprint.
                     </p>
 
                     <div className="mt-2.5 flex items-baseline justify-between text-[11px]">
-                      <span className="text-slate-300">Net Developable Area</span>
-                      <span className="font-mono-tech font-bold text-emerald-300">
-                        {hydrology.netDevelopableAreaHa.toFixed(2)} ha{' '}
+                      <span className="text-slate-300">True Net Developable</span>
+                      <span
+                        data-testid="maplab-true-nda-readout"
+                        className="font-mono-tech font-bold text-emerald-300"
+                      >
+                        {dealIntelligence.trueNda.trueNdaHa.toFixed(2)} ha{' '}
                         <span className="font-normal text-slate-400">
-                          ({Math.round(hydrology.netDevelopablePct)}% of{' '}
-                          {hydrology.grossAreaHa.toFixed(2)} ha)
+                          ({Math.round(dealIntelligence.trueNda.trueNdaPct)}% ·{' '}
+                          {dealIntelligence.trueNda.projectedYieldLots} lots)
                         </span>
                       </span>
                     </div>
@@ -2398,7 +3068,7 @@ function CutSheetWorkbench({
                       <div
                         className="h-full bg-emerald-400 transition-all"
                         style={{
-                          width: `${Math.min(100, Math.max(0, hydrology.netDevelopablePct))}%`,
+                          width: `${Math.min(100, Math.max(0, dealIntelligence.trueNda.trueNdaPct))}%`,
                         }}
                       />
                     </div>
@@ -2406,27 +3076,191 @@ function CutSheetWorkbench({
                     <div className="mt-2.5 grid grid-cols-3 gap-1.5 text-center">
                       <div className="rounded border border-slate-400/12 bg-[#0a0f17] p-1.5">
                         <div className="text-[9.5px] text-slate-400">
-                          Steep &gt;15%
+                          Civil Slope/D8
                         </div>
                         <div className="font-mono-tech mt-0.5 text-[11px] font-bold text-rose-300">
-                          {hydrology.steepAreaHa.toFixed(2)} ha
+                          {(dealIntelligence.trueNda.civilConstrainedSqm / 10000).toFixed(2)} ha
                         </div>
                       </div>
                       <div className="rounded border border-slate-400/12 bg-[#0a0f17] p-1.5">
                         <div className="text-[9.5px] text-slate-400">
-                          Flood/Enviro
-                        </div>
-                        <div className="font-mono-tech mt-0.5 text-[11px] font-bold text-sky-300">
-                          {hydrology.floodAreaHa.toFixed(2)} ha
-                        </div>
-                      </div>
-                      <div className="rounded border border-slate-400/12 bg-[#0a0f17] p-1.5">
-                        <div className="text-[9.5px] text-slate-400">
-                          Drainage
+                          BAL/Flood/Env
                         </div>
                         <div className="font-mono-tech mt-0.5 text-[11px] font-bold text-amber-300">
-                          {hydrology.drainageAreaHa.toFixed(2)} ha
+                          {(dealIntelligence.trueNda.envConstrainedSqm / 10000).toFixed(2)} ha
                         </div>
+                      </div>
+                      <div className="rounded border border-slate-400/12 bg-[#0a0f17] p-1.5">
+                        <div className="text-[9.5px] text-slate-400">
+                          OSD Basin
+                        </div>
+                        <div className="font-mono-tech mt-0.5 text-[11px] font-bold text-sky-300">
+                          {formatNum(dealIntelligence.trueNda.osdFootprintSqm)} m²
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Connected Environmental Constraints (EnviroSim Screening) */}
+                  <div
+                    data-testid="maplab-envirosim-card"
+                    className="rounded-lg border border-amber-400/22 bg-[#111824] p-2.5"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="inline-flex items-center gap-1.5 text-[10px] font-bold tracking-wider text-amber-300 uppercase">
+                        <ShieldAlert size={12} />
+                        <span>EnviroSim Constraints ({activeState})</span>
+                      </span>
+                      <span className="font-mono-tech text-[10px] text-amber-200">
+                        +{formatCompactAud(dealIntelligence.balUpliftTotalAud)} BAL
+                      </span>
+                    </div>
+                    <p className="mt-1 text-[10px] text-slate-400">
+                      {activeStateProfile.bushfireInstrument} ·{' '}
+                      {activeStateProfile.floodDataset}
+                    </p>
+
+                    <div className="mt-2.5 space-y-2.5 text-[11px]">
+                      <div>
+                        <div className="mb-1 flex justify-between text-slate-300">
+                          <span>AS 3959 Bushfire Rating (BAL)</span>
+                          <span className="font-mono-tech text-amber-300">
+                            {envConstraints.balRating} (+$
+                            {formatNum(
+                              BAL_BENCHMARKS[envConstraints.balRating].upliftPerLotAud,
+                            )}
+                            /lot)
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-3 gap-1">
+                          {(Object.keys(BAL_BENCHMARKS) as BalRating[]).map(
+                            (rating) => (
+                              <button
+                                key={rating}
+                                type="button"
+                                data-testid={`maplab-bal-${rating.toLowerCase().replace('.', '_')}`}
+                                onClick={() =>
+                                  setEnvConstraints((prev) => ({
+                                    ...prev,
+                                    balRating: rating,
+                                  }))
+                                }
+                                className={`font-mono-tech cursor-pointer rounded border px-1.5 py-1 text-[10px] font-semibold transition-colors ${
+                                  envConstraints.balRating === rating
+                                    ? rating === 'BAL-FZ' || rating === 'BAL-40'
+                                      ? 'border-rose-400 bg-rose-500/20 text-rose-200'
+                                      : 'border-amber-400 bg-amber-500/20 text-amber-200'
+                                    : 'border-slate-400/15 bg-[#0b1018] text-slate-300 hover:text-white'
+                                }`}
+                              >
+                                {rating}
+                              </button>
+                            ),
+                          )}
+                        </div>
+                      </div>
+
+                      <label className="block">
+                        <div className="flex justify-between text-slate-300">
+                          <span>1% AEP Flood Overlay</span>
+                          <span className="font-mono-tech text-sky-300">
+                            {envConstraints.floodOverlayPct}% of lot
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          data-testid="maplab-flood-slider"
+                          min={0}
+                          max={80}
+                          step={5}
+                          value={envConstraints.floodOverlayPct}
+                          onChange={(e) =>
+                            setEnvConstraints((prev) => ({
+                              ...prev,
+                              floodOverlayPct: Number(e.target.value),
+                            }))
+                          }
+                          aria-label="1% AEP Flood Overlay Percentage"
+                          className="mt-1 w-full accent-sky-400"
+                        />
+                      </label>
+
+                      <label className="block">
+                        <div className="flex justify-between text-slate-300">
+                          <span>Riparian / Biodiversity Corridor</span>
+                          <span className="font-mono-tech text-emerald-300">
+                            {envConstraints.riparianBiodiversityPct}% of lot
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          data-testid="maplab-riparian-slider"
+                          min={0}
+                          max={50}
+                          step={5}
+                          value={envConstraints.riparianBiodiversityPct}
+                          onChange={(e) =>
+                            setEnvConstraints((prev) => ({
+                              ...prev,
+                              riparianBiodiversityPct: Number(e.target.value),
+                            }))
+                          }
+                          aria-label="Riparian Biodiversity Corridor Percentage"
+                          className="mt-1 w-full accent-emerald-400"
+                        />
+                      </label>
+                    </div>
+                  </div>
+
+                  {/* Automated On-Site Detention (OSD) Basin Sizer (ARR 2019) */}
+                  <div
+                    data-testid="maplab-osd-sizer-card"
+                    className="rounded-lg border border-sky-400/22 bg-[#111824] p-2.5"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[10px] font-bold tracking-wider text-sky-300 uppercase">
+                        Auto OSD Basin Sizer (ARR 2019)
+                      </span>
+                      <span className="font-mono-tech text-[10px] text-slate-300">
+                        {dealIntelligence.osd.rainfallIntensityMmHr} mm/hr ({activeState})
+                      </span>
+                    </div>
+                    <div className="mt-2 grid grid-cols-2 gap-1.5">
+                      <div className="rounded border border-slate-400/12 bg-[#0a0f17] px-2 py-1.5">
+                        <div className="text-[9.5px] text-slate-400">
+                          Engineered Basin Vol
+                        </div>
+                        <div className="font-mono-tech mt-0.5 text-xs font-bold text-sky-300">
+                          {formatNum(dealIntelligence.osd.engineeredBasinVolumeM3)} m³
+                        </div>
+                      </div>
+                      <div className="rounded border border-slate-400/12 bg-[#0a0f17] px-2 py-1.5">
+                        <div className="text-[9.5px] text-slate-400">
+                          Est. OSD Civil Cost
+                        </div>
+                        <div className="font-mono-tech mt-0.5 text-xs font-bold text-amber-300">
+                          {formatCompactAud(dealIntelligence.osd.estimatedOsdCostAud)}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="mt-2 space-y-1 font-mono-tech text-[10px] text-slate-300">
+                      <div className="flex justify-between">
+                        <span className="text-slate-400">Natural Pond Credit</span>
+                        <span className="text-emerald-300">
+                          -{formatNum(dealIntelligence.osd.naturalDepressionCreditM3)} m³
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-slate-400">Basin Footprint</span>
+                        <span>
+                          {formatNum(dealIntelligence.osd.basinFootprintSqm)} m²
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-slate-400">Rec. Outlet Invert</span>
+                        <span>
+                          {dealIntelligence.osd.recommendedInvertAHD.toFixed(2)} m AHD
+                        </span>
                       </div>
                     </div>
                   </div>
@@ -2907,19 +3741,38 @@ function CutSheetWorkbench({
                             </button>
                           ))}
                         </div>
+                        {rateInputError && (
+                          <div
+                            role="alert"
+                            className="rounded border border-rose-500/40 bg-rose-500/12 px-2 py-1 text-[10px] text-rose-200"
+                          >
+                            {rateInputError}
+                          </div>
+                        )}
                         <div className="grid grid-cols-2 gap-1.5">
                           <label className="block text-slate-400">
                             Cut $/m³
                             <input
                               type="number"
                               min={0}
+                              max={500}
                               value={customRates.cutRate ?? activeSoilSpec.cutRate}
-                              onChange={(e) =>
+                              onChange={(e) => {
+                                const check = validateNonNegativeNumber(
+                                  e.target.value,
+                                  'Cut rate',
+                                  500,
+                                );
+                                if (!check.valid) {
+                                  setRateInputError(check.error);
+                                  return;
+                                }
+                                setRateInputError(null);
                                 setCustomRates((r) => ({
                                   ...r,
                                   cutRate: Number(e.target.value),
-                                }))
-                              }
+                                }));
+                              }}
                               className="font-mono-tech mt-0.5 w-full rounded border border-slate-400/20 bg-[#111824] px-1.5 py-0.5 text-slate-100"
                             />
                           </label>
@@ -3291,20 +4144,51 @@ function CutSheetWorkbench({
             frame #0
           </span>
           <span className="hidden text-slate-500 md:inline">
-            GDA2020 / MGA2020 · AHD Pre-feasibility screening
+            Map Lab. DA · GDA2020 / MGA2020 · AHD Pre-feasibility screening
           </span>
         </div>
       </footer>
+
+      {/* 4. CLOUD ACCOUNT & PRIVATE SAVED SITES VAULT DRAWER */}
+      <DealVaultDrawer
+        open={vaultOpen}
+        onClose={() => setVaultOpen(false)}
+        session={session}
+        onSessionChange={(nextSession) => {
+          setSession(nextSession);
+          setSaveFeedback(null);
+          if (!nextSession) {
+            setSavedDeals([]);
+            setActiveDealId(null);
+            if (typeof window !== 'undefined' && window.location.hash.includes('deal=')) {
+              window.history.replaceState(null, '', `#tab=${inspectorTab}`);
+            }
+          }
+        }}
+        deals={savedDeals}
+        dealsLoading={dealsLoading}
+        dealsError={dealsError}
+        onRefreshDeals={() => void refreshSavedDeals(session)}
+        onOpenDeal={(deal) => {
+          applySavedDealToWorkspace(deal);
+          setVaultOpen(false);
+        }}
+        activeDealId={activeDealId}
+        privateAccessBlockedMsg={privateAccessBlockedMsg}
+        onClearAccessBlocked={() => setPrivateAccessBlockedMsg(null)}
+      />
     </div>
   );
 }
 
 /**
- * CutSheet AU Pro — Fused Commercial Australian Terrain, Hydrology & Bulk Earthworks Workstation.
- * Combines full-bleed MapLibre GL Satellite/Dark GIS draping, Horn 3x3 slope breakdown,
- * Barnes Priority-Flood ponding detection, D8 overland flow routing, 4 civil grading solvers
- * (Best-Fit Plane, Auto-Terrace, Max Grade %, Flat Pad), Three.js WebGL2 3D Studio,
- * LandXML 1.2 / DXF / PDF / BOQ CSV / GeoJSON / XYZ exports, and live @devaware/os-bridge sync into Feaso OS.
+ * Map Lab. DA — Commercial Australian Parcel, Civil Terrain, Hydrology & Deal Intelligence Platform.
+ * Unifies all 8 Australian states & territories (NSW, VIC, QLD, WA, SA, TAS, ACT, NT) with live
+ * cadastral parcel snapping, Horn 3x3 slope breakdown, Barnes Priority-Flood ponding, D8 overland
+ * flow routing, automated ARR 2019 OSD basin sizing, EnviroSim BAL/Flood screening, 4 civil grading
+ * solvers, iterative 8-state stamp duty & Residual Land Value (RLV) optimization, Three.js 3D Studio,
+ * LandXML / DXF / PDF Memo / BOQ CSV / GeoJSON / XYZ exports, private cloud deal vault, and live
+ * @devaware/os-bridge sync.
  */
 export function CutSheetApp() {
   const {
@@ -3373,8 +4257,8 @@ export function CutSheetApp() {
 
   return (
     <AppShellFrame
-      appName="CutSheet AU"
-      appSubtitle="GIS Terrain, Hydrology & Bulk Earthworks Workstation"
+      appName="Map Lab. DA"
+      appSubtitle="Commercial Australian Parcel, Civil Terrain & Deal Intelligence"
       status={status}
       errorMessage={errorMessage}
       onRetryHandshake={retryHandshake}

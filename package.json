@@ -1,9 +1,9 @@
 {
   "name": "cutsheet-au",
   "private": true,
-  "version": "2.0.0",
+  "version": "3.0.0",
   "type": "module",
-  "description": "Commercial Australian GDA2020 / MGA2020 GIS Terrain, D8 Overland Flow Hydrology & Bulk Earthworks Workstation (standalone & devaware-os compatible).",
+  "description": "Map Lab. DA — Commercial 8-State Australian Parcel Mapping, Civil Terrain, Hydrology & Residual Land Value Intelligence Platform.",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",

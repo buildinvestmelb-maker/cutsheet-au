@@ -21,6 +21,7 @@ import {
   type GradingStrategy,
 } from './gridVolumeEngine';
 import type { HydrologyAnalysisResult } from './hydrologyEngine';
+import type { MapLabDealIntelligence } from '../deal/mapLabIntelligenceEngine';
 
 const STRATEGY_LABELS: Readonly<Record<GradingStrategy, string>> = {
   'best-fit-plane': 'Best-Fit Plane (OLS)',
@@ -522,6 +523,8 @@ export function buildCutSheetPdfBlob(
   project: SiteProject,
   result: EarthworksGridResult,
   hydrology?: HydrologyAnalysisResult,
+  dealIntelligence?: MapLabDealIntelligence,
+  provenanceLabel?: string,
 ): Blob {
   const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
   const pageW = doc.internal.pageSize.getWidth();
@@ -541,18 +544,18 @@ export function buildCutSheetPdfBlob(
   doc.setTextColor(61, 174, 233);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(9);
-  doc.text('DEVAWARE-OS  •  CUTSHEET AU PRO', margin, 11);
+  doc.text('MAP LAB. DA  •  COMMERCIAL SITE, CIVIL & ACQUISITION MEMO', margin, 11);
 
   doc.setTextColor(245, 248, 252);
   doc.setFontSize(15);
-  doc.text(project.name || 'Australian Civil Site Assessment', margin, 19);
+  doc.text(project.name || 'Australian Commercial Site Assessment', margin, 19);
 
   doc.setTextColor(175, 190, 208);
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(8.5);
   const subLine = [
     project.location.address || 'Australia',
-    project.location.lga,
+    project.geometry.parcelId ? `Parcel ${project.geometry.parcelId}` : '',
     `${project.location.state} • ${project.location.mgaEpsg} (Zone ${project.location.mgaZone})`,
   ]
     .filter(Boolean)
@@ -564,7 +567,9 @@ export function buildCutSheetPdfBlob(
   doc.setTextColor(52, 211, 153);
   doc.setFont('helvetica', 'bold');
   doc.text(
-    `Developability ${result.developability.score}/100 (${result.developability.riskLevel})`,
+    dealIntelligence
+      ? `Max Offer (RLV): ${formatPdfAud(dealIntelligence.residualLandValueAud)} • ${dealIntelligence.dealViabilityLabel}`
+      : `Developability ${result.developability.score}/100 (${result.developability.riskLevel})`,
     pageW - margin,
     26,
     { align: 'right' },
@@ -579,8 +584,9 @@ export function buildCutSheetPdfBlob(
   cursorY += 4;
 
   const grossHa = result.insideAreaSqm / 10_000;
-  const ndaHa = hydrology?.netDevelopableAreaHa ?? grossHa * 0.78;
-  const ndaPct = hydrology?.netDevelopablePct ?? 78;
+  const ndaHa = dealIntelligence?.trueNda.trueNdaHa ?? hydrology?.netDevelopableAreaHa ?? grossHa * 0.78;
+  const ndaPct = dealIntelligence?.trueNda.trueNdaPct ?? hydrology?.netDevelopablePct ?? 78;
+  const lotsBasis = dealIntelligence?.trueNda.projectedYieldLots ?? result.estimatedLots;
 
   autoTable(doc, {
     startY: cursorY,
@@ -596,9 +602,9 @@ export function buildCutSheetPdfBlob(
         `Datum FFL ${result.targetFflAHD.toFixed(2)} m AHD • Batter 1:${result.batterSlopeRatio}`,
       ],
       [
-        'Gross Parcel / Net Developable Area',
+        'Gross Parcel / True Net Developable Area',
         `${grossHa.toFixed(2)} ha  /  ${ndaHa.toFixed(2)} ha (${ndaPct.toFixed(0)}%)`,
-        `Est. yield basis ${result.estimatedLots} lots`,
+        `Est. yield basis ${lotsBasis} lots • Provenance: ${provenanceLabel ?? 'Screening DTM'}`,
       ],
       [
         'Total Bulk Cut / Total Bulk Fill',
@@ -618,20 +624,74 @@ export function buildCutSheetPdfBlob(
       [
         'Total Est. Civil Siteworks',
         `${formatPdfAud(result.totalPackageAud)} AUD`,
-        `${formatPdfAud(result.costPerLotAud)}/lot  •  ${formatPdfAud(result.costPerHaAud)}/ha  •  $${result.costPerSqmAud.toFixed(2)}/m²`,
+        `${formatPdfAud(Math.round(result.totalPackageAud / Math.max(1, lotsBasis)))}/lot  •  ${formatPdfAud(result.costPerHaAud)}/ha  •  $${result.costPerSqmAud.toFixed(2)}/m²`,
       ],
     ],
   });
 
   cursorY =
     ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable
-      ?.finalY ?? cursorY + 46) + 8;
+      ?.finalY ?? cursorY + 46) + 7;
 
-  // Section 2: Itemised Civil Siteworks Estimate (AUD)
+  // Section 2: Connected Deal Intelligence (RLV, OSD Detention & 8-State Transfer Duty)
+  if (dealIntelligence) {
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(11);
+    doc.setTextColor(15, 23, 42);
+    doc.text('2. Acquisition Feasibility, OSD Detention & Residual Land Value', margin, cursorY);
+    cursorY += 4;
+
+    autoTable(doc, {
+      startY: cursorY,
+      margin: { left: margin, right: margin },
+      theme: 'striped',
+      headStyles: { fillColor: [16, 42, 67], textColor: [236, 244, 252], fontSize: 8.5 },
+      bodyStyles: { fontSize: 8.5, textColor: [30, 41, 59] },
+      columnStyles: { 2: { halign: 'right', fontStyle: 'bold' } },
+      head: [['Commercial Acquisition Metric', 'Basis / Statutory Context', 'Estimate']],
+      body: [
+        [
+          'Max Land Offer Price (Residual Land Value)',
+          `${formatPdfAud(dealIntelligence.rlvPerSqmAud)}/m² • ${formatPdfAud(dealIntelligence.rlvPerHaAud)}/ha • ${formatPdfAud(dealIntelligence.rlvPerLotAud)}/lot`,
+          `${formatPdfAud(dealIntelligence.residualLandValueAud)} AUD`,
+        ],
+        [
+          'Projected Gross Realisation / Dev Margin / IRR',
+          `${dealIntelligence.trueNda.projectedYieldLots} lots • ${dealIntelligence.dealViabilityLabel}`,
+          `${formatPdfAud(dealIntelligence.grossRealisationAud)} (${dealIntelligence.projectedMarginOnCostPct}% MOC / ${dealIntelligence.projectedAnnualIrrPct}% IRR)`,
+        ],
+        [
+          `Statutory Transfer Duty (${dealIntelligence.state})`,
+          `${dealIntelligence.stampDutyAuthority} (${dealIntelligence.stampDutyEffectivePct}% eff.)`,
+          `${formatPdfAud(dealIntelligence.statutoryStampDutyAud)} AUD`,
+        ],
+        [
+          'Auto On-Site Detention (OSD) Basin Allowance',
+          `${PDF_NUM_FORMAT.format(dealIntelligence.osd.engineeredBasinVolumeM3)} m³ (${dealIntelligence.osd.rainfallIntensityMmHr} mm/hr 1% AEP, Invert ${dealIntelligence.osd.recommendedInvertAHD}m AHD)`,
+          `${formatPdfAud(dealIntelligence.osd.estimatedOsdCostAud)} AUD`,
+        ],
+        [
+          'AS 3959 Bushfire / Environmental Uplift',
+          `Risk: ${dealIntelligence.balRiskLevel} • Env loss ${Math.round(dealIntelligence.trueNda.envConstrainedSqm / 100) / 100} ha`,
+          `${formatPdfAud(dealIntelligence.balUpliftTotalAud)} AUD`,
+        ],
+      ],
+    });
+
+    cursorY =
+      ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable
+        ?.finalY ?? cursorY + 42) + 7;
+  }
+
+  // Section 3: Itemised Civil Siteworks Estimate (AUD)
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(11);
   doc.setTextColor(15, 23, 42);
-  doc.text('2. Itemised Civil Siteworks Estimate (AUD)', margin, cursorY);
+  doc.text(
+    `${dealIntelligence ? '3' : '2'}. Itemised Civil Siteworks Estimate (AUD)`,
+    margin,
+    cursorY,
+  );
   cursorY += 4;
 
   const rates = SOIL_RATES_AUD[result.soilClass];
@@ -680,7 +740,7 @@ export function buildCutSheetPdfBlob(
 
   costBody.push([
     'TOTAL CIVIL EARTHWORKS & RETAINING PACKAGE',
-    `${rates.label} • ${result.estimatedLots} lots`,
+    `${rates.label} • ${lotsBasis} lots`,
     `${formatPdfAud(result.totalPackageAud)} AUD`,
   ]);
 
@@ -697,14 +757,22 @@ export function buildCutSheetPdfBlob(
 
   cursorY =
     ((doc as unknown as { lastAutoTable?: { finalY?: number } }).lastAutoTable
-      ?.finalY ?? cursorY + 46) + 8;
+      ?.finalY ?? cursorY + 46) + 7;
 
-  // Section 3: Civil Slope Breakdown & D8 Overland Flow Hydrology
+  // Section 4: Civil Slope Breakdown & D8 Overland Flow Hydrology
   if (hydrology) {
+    if (cursorY > 235) {
+      doc.addPage();
+      cursorY = 18;
+    }
     doc.setFont('helvetica', 'bold');
     doc.setFontSize(11);
     doc.setTextColor(15, 23, 42);
-    doc.text('3. Terrain Slope Breakdown & D8 Hydrology Screening', margin, cursorY);
+    doc.text(
+      `${dealIntelligence ? '4' : '3'}. Terrain Slope Breakdown & D8 Hydrology Screening`,
+      margin,
+      cursorY,
+    );
     cursorY += 4;
 
     const hydroRows: string[][] = hydrology.slopeBands.map((band) => [
@@ -737,13 +805,13 @@ export function buildCutSheetPdfBlob(
     });
   }
 
-  // Footer disclaimer
+  // Footer disclaimer on final page
   const pageH = doc.internal.pageSize.getHeight();
   doc.setFont('helvetica', 'normal');
-  doc.setFontSize(7.5);
+  doc.setFontSize(7.3);
   doc.setTextColor(100, 116, 139);
   doc.text(
-    'Preliminary civil feasibility screening generated by devaware-os CutSheet AU Pro (GDA2020 / AHD). Verify against certified survey & geotechnical report prior to construction.',
+    'Pre-Feasibility Civil & Acquisition Screening by Map Lab. DA (GDA2020 / MGA2020 / AHD). Not a licensed cadastral survey or certified construction design.',
     margin,
     pageH - 9,
   );

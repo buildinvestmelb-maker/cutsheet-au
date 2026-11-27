@@ -17,11 +17,15 @@ import {
   createRectPolygonFeatureCollection,
   extractPrimaryPolygon,
   getMapStyleConfig,
-  getPublicCadastreLayerForState,
   mga2020ToWgs84,
   wgs84ToMga2020,
   type MapBasemapMode,
 } from '../../engines/geo/auGeoKernel';
+import {
+  AU_STATE_SPATIAL_REGISTRY,
+  fetchActBlocksGeoJson,
+  getUniversalCadastreOverlayConfig,
+} from '../../engines/geo/auParcelClient';
 import { ensureMapLibreWorker } from '../../engines/geo/maplibreInit';
 
 export type CutSheetCadTool =
@@ -50,6 +54,8 @@ export interface TerrainMap2DProps {
   activeTool: CutSheetCadTool;
   onToolChange: (tool: CutSheetCadTool) => void;
   onBoundaryDrawn: (boundary: FeatureCollection) => void;
+  onParcelSnapRequest?: (lat: number, lng: number) => void;
+  parcelSnapLoading?: boolean;
   sectionStart: [number, number];
   sectionEnd: [number, number];
   onSectionLineChange: (start: [number, number], end: [number, number]) => void;
@@ -63,6 +69,8 @@ export interface TerrainMap2DProps {
 
 const CADASTRE_SRC = 'cutsheet-cadastre-src';
 const CADASTRE_LAYER = 'cutsheet-cadastre-layer';
+const ACT_BLOCKS_SRC = 'cutsheet-act-blocks-src';
+const ACT_BLOCKS_LINE_LAYER = 'cutsheet-act-blocks-line';
 const LOCAL_GRID_SRC = 'cutsheet-local-grid-src';
 const LOCAL_GRID_LAYER = 'cutsheet-local-grid-layer';
 const TERRAIN_LENS_SRC = 'cutsheet-terrain-lens-src';
@@ -336,6 +344,8 @@ export function TerrainMap2D({
   activeTool,
   onToolChange,
   onBoundaryDrawn,
+  onParcelSnapRequest,
+  parcelSnapLoading = false,
   sectionStart,
   sectionEnd,
   onSectionLineChange,
@@ -371,10 +381,12 @@ export function TerrainMap2D({
   const draftSectionRef = useRef<[number, number] | null>(draftSectionStart);
   const lastFlySeqRef = useRef<number>(0);
   const lastLensSigRef = useRef<string | null>(null);
+  const lastCadastreSigRef = useRef<string | null>(null);
 
   const onBasemapChangeRef = useRef(onBasemapModeChange);
   const onToolChangeRef = useRef(onToolChange);
   const onBoundaryDrawnRef = useRef(onBoundaryDrawn);
+  const onParcelSnapRef = useRef(onParcelSnapRequest);
   const onSectionChangeRef = useRef(onSectionLineChange);
   const onCursorMoveRef = useRef(onCursorMove);
 
@@ -382,12 +394,14 @@ export function TerrainMap2D({
     onBasemapChangeRef.current = onBasemapModeChange;
     onToolChangeRef.current = onToolChange;
     onBoundaryDrawnRef.current = onBoundaryDrawn;
+    onParcelSnapRef.current = onParcelSnapRequest;
     onSectionChangeRef.current = onSectionLineChange;
     onCursorMoveRef.current = onCursorMove;
   }, [
     onBasemapModeChange,
     onBoundaryDrawn,
     onCursorMove,
+    onParcelSnapRequest,
     onSectionLineChange,
     onToolChange,
   ]);
@@ -492,19 +506,35 @@ export function TerrainMap2D({
     const snap = snapshotRef.current;
 
     try {
-      // 1. Optional State Cadastre WMS/ArcGIS tile overlay (NSW / QLD)
-      const cadastreSpec = snap.showCadastre
-        ? getPublicCadastreLayerForState(snap.stateCode)
+      // 1. Universal 8-State Australian Cadastre Overlay (NSW, VIC, QLD, WA, SA, TAS, ACT, NT)
+      const cadastreCfg = snap.showCadastre
+        ? getUniversalCadastreOverlayConfig(snap.stateCode)
         : null;
-      if (cadastreSpec && activeBasemapRef.current !== 'offline-grid') {
+      const cadastreSig =
+        cadastreCfg && activeBasemapRef.current !== 'offline-grid'
+          ? `${snap.stateCode}:${cadastreCfg.mode}:${cadastreCfg.tileUrl ?? 'vec'}`
+          : 'off';
+
+      if (cadastreSig !== lastCadastreSigRef.current) {
+        removeLayerAndSourceSafe(map, [CADASTRE_LAYER], CADASTRE_SRC);
+        removeLayerAndSourceSafe(map, [ACT_BLOCKS_LINE_LAYER], ACT_BLOCKS_SRC);
+        lastCadastreSigRef.current = cadastreSig;
+      }
+
+      if (
+        cadastreCfg &&
+        cadastreCfg.mode === 'raster' &&
+        cadastreCfg.tileUrl &&
+        activeBasemapRef.current !== 'offline-grid'
+      ) {
         if (!map.getSource(CADASTRE_SRC)) {
           map.addSource(CADASTRE_SRC, {
             type: 'raster',
-            tiles: [cadastreSpec.tileUrl],
-            tileSize: cadastreSpec.tileSize,
-            minzoom: cadastreSpec.minzoom,
-            maxzoom: cadastreSpec.maxzoom,
-            attribution: cadastreSpec.attribution,
+            tiles: [cadastreCfg.tileUrl],
+            tileSize: cadastreCfg.tileSize,
+            minzoom: cadastreCfg.minzoom,
+            maxzoom: cadastreCfg.maxzoom,
+            attribution: cadastreCfg.attribution,
           });
         }
         if (!map.getLayer(CADASTRE_LAYER)) {
@@ -512,11 +542,42 @@ export function TerrainMap2D({
             id: CADASTRE_LAYER,
             type: 'raster',
             source: CADASTRE_SRC,
-            paint: { 'raster-opacity': cadastreSpec.defaultOpacity },
+            paint: { 'raster-opacity': cadastreCfg.opacity },
           });
         }
-      } else {
-        removeLayerAndSourceSafe(map, [CADASTRE_LAYER], CADASTRE_SRC);
+      } else if (
+        cadastreCfg &&
+        cadastreCfg.mode === 'act-vector' &&
+        activeBasemapRef.current !== 'offline-grid'
+      ) {
+        const b = map.getBounds();
+        if (b && map.getZoom() >= 13.5) {
+          void fetchActBlocksGeoJson({
+            west: b.getWest(),
+            south: b.getSouth(),
+            east: b.getEast(),
+            north: b.getNorth(),
+          }).then((fc) => {
+            if (!fc || !mapRef.current) return;
+            try {
+              setOrCreateGeoJsonSource(mapRef.current, ACT_BLOCKS_SRC, fc);
+              if (!mapRef.current.getLayer(ACT_BLOCKS_LINE_LAYER)) {
+                mapRef.current.addLayer({
+                  id: ACT_BLOCKS_LINE_LAYER,
+                  type: 'line',
+                  source: ACT_BLOCKS_SRC,
+                  paint: {
+                    'line-color': '#facc15',
+                    'line-width': 1.25,
+                    'line-opacity': 0.78,
+                  },
+                });
+              }
+            } catch {
+              // Ignore if map style changed mid-flight
+            }
+          });
+        }
       }
 
       // 2. Local 50m MGA grid when in offline-grid mode
@@ -936,8 +997,12 @@ export function TerrainMap2D({
       ];
 
       if (tool === 'cadastre-snap') {
-        const fc = createRectPolygonFeatureCollection(pt[1], pt[0], 140, 120);
-        onBoundaryDrawnRef.current(fc);
+        if (onParcelSnapRef.current) {
+          onParcelSnapRef.current(pt[1], pt[0]);
+        } else {
+          const fc = createRectPolygonFeatureCollection(pt[1], pt[0], 140, 120);
+          onBoundaryDrawnRef.current(fc);
+        }
         onToolChangeRef.current('select');
         return;
       }
@@ -1157,7 +1222,11 @@ export function TerrainMap2D({
         onToolChange('select');
       }
     } else if (activeTool === 'cadastre-snap') {
-      onBoundaryDrawn(createRectPolygonFeatureCollection(pt[1], pt[0], 140, 120));
+      if (onParcelSnapRequest) {
+        onParcelSnapRequest(pt[1], pt[0]);
+      } else {
+        onBoundaryDrawn(createRectPolygonFeatureCollection(pt[1], pt[0], 140, 120));
+      }
       onToolChange('select');
     } else if (activeTool === 'draw-rect') {
       if (draftPoints.length === 0) {
@@ -1176,19 +1245,20 @@ export function TerrainMap2D({
     }
   };
 
+  const stateAuthorityShort = AU_STATE_SPATIAL_REGISTRY[stateCode].authority;
   const toolInstruction =
     activeTool === 'cadastre-snap'
-      ? 'Click anywhere on the map to place a 1.68 ha site parcel & analyse terrain'
+      ? `Tap any lot to snap legal ${stateCode} boundary (${stateAuthorityShort})`
       : activeTool === 'draw-rect'
         ? draftPoints.length === 0
-          ? 'Rectangle Tool: Click Corner 1 on map'
-          : 'Rectangle Tool: Click opposite Corner 2 to commit parcel'
+          ? 'Rectangle Tool: Tap Corner 1 on map'
+          : 'Rectangle Tool: Tap opposite Corner 2 to commit parcel'
         : activeTool === 'draw-polygon'
-          ? `Polygon Tool: Click boundary vertices (${draftPoints.length} placed) — click Finish when >= 3`
+          ? `Polygon Tool: Tap boundary vertices (${draftPoints.length} placed) — tap Finish when >= 3`
           : activeTool === 'draw-section'
             ? !draftSectionStart
-              ? 'Cross-Section Tool: Click Point A (Start)'
-              : "Cross-Section Tool: Click Point A' (End)"
+              ? 'Cross-Section Tool: Tap Point A (Start)'
+              : "Cross-Section Tool: Tap Point A' (End)"
             : null;
 
   return (
@@ -1196,6 +1266,16 @@ export function TerrainMap2D({
       data-testid="cutsheet-2d-map"
       className="relative flex min-h-[290px] w-full flex-1 flex-col overflow-hidden bg-[#070b14]"
     >
+      {/* Live Legal Parcel Snap Loading Pill */}
+      {parcelSnapLoading && (
+        <div
+          role="status"
+          className="pointer-events-none absolute top-2.5 left-1/2 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full border border-[#3daee9]/65 bg-[#0b1320]/95 px-3.5 py-1.5 text-[11px] font-semibold text-sky-100 shadow-xl backdrop-blur"
+        >
+          <span className="h-2 w-2 animate-ping rounded-full bg-[#3daee9]" />
+          <span>Querying live {stateCode} legal cadastre…</span>
+        </div>
+      )}
       {/* Offline fallback notice */}
       {basemapNotice && (
         <div className="pointer-events-auto absolute top-2.5 left-2.5 z-20 flex items-center gap-1.5 rounded-md border border-amber-400/35 bg-[#101722]/92 px-2.5 py-1 text-[10.5px] text-amber-200 shadow-lg backdrop-blur">

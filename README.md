@@ -1,39 +1,44 @@
-# CutSheet AU Pro
+# Map Lab. DA
 
-**Commercial Australian GIS Terrain, Hydrology & Bulk Earthworks Workstation** — built natively on **GDA2020 / MGA2020 (Zones 49–56 / EPSG:7849–7856)** and **Australian Height Datum (AHD)**. Runs both **standalone** (ready for 1-click Vercel deployment) and **embedded inside `devaware-os`** with live `@devaware/os-bridge` sync into `Feaso OS`.
+**Commercial Australian Parcel Mapping, Civil Terrain, Hydrology & Deal Intelligence Platform** — built natively on **GDA2020 / MGA2020 (Zones 49–56 / EPSG:7849–7856)** and **Australian Height Datum (AHD)** with universal parity across **all 8 Australian states and territories (`NSW, VIC, QLD, WA, SA, TAS, ACT, NT`)**.
 
-**Live Web App (Mobile & Desktop):** [https://buildinvestmelb-maker.github.io/cutsheet-au/](https://buildinvestmelb-maker.github.io/cutsheet-au/)
+**Live Web App (Vercel Production — Mobile & Desktop):** [https://cutsheet-au-rlfu.vercel.app/](https://cutsheet-au-rlfu.vercel.app/)
 
 [![Import & Deploy on Vercel](https://vercel.com/button)](https://vercel.com/new/import?s=https://github.com/buildinvestmelb-maker/cutsheet-au)
 
-## Core Engineering Capabilities
+## Key Commercial Capabilities
 
-- **Full-Bleed GIS & CAD Workstation (`MapLibre GL v6` + `Three.js WebGL2`)**
-  - Satellite (Esri World Imagery), Dark Vector (OpenFreeMap), and zero-network Offline MGA2020 Grid basemaps + NSW/QLD public cadastre tile overlays.
-  - Real-time draped **Terrain Lens** (`Hillshade`, `Civil Slope Bands`, `Cut / Fill Map`) with sun azimuth, sun altitude, vertical exaggeration, and opacity sliders.
-  - Interactive CAD toolbar: 1-Click Parcel Snap, Draw Custom Polygon, Draw Site Rectangle, Draw Section A–A' Line, AU Address / `lat, lng` search (Photon AU), Capital City jumps (`Sydney`, `Melbourne`, `Brisbane`, `Perth`, `Adelaide`), `3D Map` pitched view, and full-bleed **3D Studio** (`Three.js WebGL2`).
-- **Live Australian DEM Ingestion**
-  - **AWS Terrarium DEM** PNG tile streaming (`elevation = R*256 + G + B/256 - 32768`).
-  - **ELVIS 1m LiDAR / GeoTIFF** (`geotiff` binary raster parsing with automatic GDA2020/GDA94 EPSG detection).
-  - **Survey CSV / XYZ** point clouds interpolated onto metric GDA2020 grids via Inverse Distance Weighting (IDW).
-- **Terrain Hydrology & Net Developable Area (`src/engines/earthworks/hydrologyEngine.ts`)**
-  - **Horn 3×3 Metric Slope Classification:** 4 Australian civil bands (`0–5% Flat`, `5–10% Moderate`, `10–15% Benching`, `>15% Steep`) with exact `%` and `ha`.
-  - **Barnes Priority-Flood Depression Detection:** Identifies enclosed ponding basins (`>0.15 m`), computes natural detention storage (`m³`), and drapes amber depression polygons.
-  - **D8 Overland Flow Routing:** Computes steepest-descent drainage direction & upstream contributing catchment (`ha`), rendering width-scaled cyan overland flow channels & Net Developable Area (NDA).
-- **4 Civil Grading Solvers & Commercial QS Engine (`src/engines/earthworks/gridVolumeEngine.ts`)**
-  - **Best-Fit Plane (OLS)**, **Auto-Terrace Benches**, **Max Grade % Clamped**, and **Flat Pad (Uniform FFL)**.
-  - **Target Cut:Fill Ratio** datum solver (`1.00 balanced` → `1.10 compaction` → `1.25 bulking`), **Zero-Balance FFL** binary search optimizer, and **Scenario A Pin** live cost comparison.
-  - **AS 2870 Geotechnical Unit Rates** (`Sand`, `Clay`, `Rock`), custom **Edit Rates** drawer, Basalt/Rock Breakout %, Topsoil Strip & Respread, automatic retaining wall step detection (`>0.6 m`), Truck & Dog (`18 m³`) haulage loads, Per-Lot / Per-Ha / Per-m² metrics, and **Terrain Developability Score (`0–100`)**.
-- **6 Commercial Engineering Exports & Share Links**
-  - **PDF Civil Engineering Report** (`jsPDF` + `jspdf-autotable`), **LandXML 1.2 TIN Surface** (12d Model / Civil 3D), **AutoCAD DXF Contours**, **Civil BOQ CSV**, **GeoJSON**, and **MGA2020 XYZ CSV**, plus zero-backend `#site=...` URL sharing.
+- **Universal 8-State Cadastral Parcel Mapping & 1-Tap Legal Parcel Snap (`api/cadastre.ts`)**
+  - Dedicated Vercel Fluid Compute GIS proxy serving official government cadastral parcel polygons & live boundary overlays across `NSW` (Spatial Services), `VIC` (Vicmap / DataVic), `QLD` (Queensland Spatial), `WA` (Landgate SLIP), `SA` (Location SA / PlanSA), `TAS` (theLIST), `ACT` (ACTmapi), and `NT` (NR Maps / NT Cadastre) with zero CORS failures and graceful outage handling.
+  - Works identically in every state and territory — zero single-state lock-in.
+- **Connected Cross-App Development Intelligence (`src/engines/deal/mapLabIntelligenceEngine.ts`)**
+  - **Paddock-to-Offer Deal Scorecard:** Fuses live civil earthworks (`CutSheet`), environmental constraints (`EnviroSim` AS 3959 BAL + 1% AEP Flood + Riparian), yield & lot sizing (`FormGen`), and iterative 2026–27 8-state statutory stamp duty & Residual Land Value (`Feaso OS`) into a live Max Land Offer Price (`RLV`, `$/m²`, `$/ha`, `$/lot`, Margin %, Est. IRR %).
+  - **Earthworks-to-RLV Optimizer:** Sweeps all 4 civil grading strategies (`Best-Fit Plane`, `Auto-Terrace`, `Max Grade %`, `Flat Pad`) across FFL datums to surface the grading configuration that maximises RLV (`+$` uplift).
+  - **Unified True Net Developable Area (NDA) & Automated ARR 2019 OSD Basin Sizer:** Combines Horn 3×3 steep slope (`>15%`), Barnes Priority-Flood natural detention storage credit, D8 overland flow channels, BAL-FZ/Flood/Riparian exclusions, and 1% AEP On-Site Detention sizing & costing.
+- **Mobile-First Field Engineering (`390×844` & Desktop `1440×900`)**
+  - `44×44px` thumb-friendly CAD tool rail, 1-tap GPS `"Locate My Site"`, compact 8-state selector, and interactive `Map | Split | Panel` bottom-sheet mode switcher with zero horizontal overflow.
+- **Private Cloud Accounts & Strict Data Wall (`src/data/cloudDealStore.ts` + `supabase/migrations/002_map_lab_da_deals.sql`)**
+  - Email/password accounts with strict per-user private saved sites, idempotent save protection, and browser Back/Forward/Refresh state recovery.
+  - Supports multi-device cloud persistence via Supabase Auth + Postgres Row-Level Security (`auth.uid() = user_id`), with automatic salted per-account IndexedDB vault fallback when Supabase env vars are omitted.
+- **6 Bankable & CAD Engineering Exports**
+  - **PDF Civil & Acquisition Memo** (`jsPDF` + `jspdf-autotable`), **LandXML 1.2 TIN**, **AutoCAD DXF Contours**, **Civil BOQ CSV**, **GeoJSON**, and **MGA2020 XYZ CSV**.
+
+## Optional Multi-Device Cloud Sync (Supabase + Vercel)
+
+To enable multi-device cloud sync across browsers and mobile devices, run [`supabase/migrations/002_map_lab_da_deals.sql`](./supabase/migrations/002_map_lab_da_deals.sql) in your Supabase project and configure these Environment Variables in your Vercel project settings:
+
+```env
+VITE_SUPABASE_URL=https://<your-project>.supabase.co
+VITE_SUPABASE_ANON_KEY=<your-anon-public-key>
+```
 
 ## Development & Verification
 
 ```bash
 npm install
 npm run dev        # Start local Vite 8 dev server
-npm run typecheck  # Strict TypeScript checking
+npm run typecheck  # Strict TypeScript checking (app + Vercel api/)
 npm run lint       # Oxlint static analysis
-npm run test       # Vitest unit tests (DEM, Hydrology, Grading, Exports)
+npm run test       # Vitest unit tests (8-state parity, RLV, OSD, privacy wall, exports)
 npm run build      # Production bundle (dist/)
 ```
