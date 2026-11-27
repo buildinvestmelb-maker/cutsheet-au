@@ -191,16 +191,24 @@ async function fetchArcgisFeaturesWithBuffer(
   lng: number,
   extraParams: string,
 ): Promise<RawGeoJsonResponse['features']> {
-  const geomPt = encodeURIComponent(`${lng},${lat}`);
+  const geomPt = encodeURIComponent(
+    JSON.stringify({ x: lng, y: lat, spatialReference: { wkid: 4326 } }),
+  );
   const ptUrl = `${baseQueryUrl}?geometry=${geomPt}&geometryType=esriGeometryPoint&inSR=4326&spatialRel=esriSpatialRelIntersects&${extraParams}&returnGeometry=true&outSR=4326&f=geojson`;
   const ptData = await fetchJsonSafe(ptUrl);
   if (ptData?.features && ptData.features.length > 0) {
     return ptData.features;
   }
-  // Tight ~20m frontage tolerance if geocoded street coordinate sits on road carriageway
-  const d = 0.00022;
+  // Tight ~25m frontage tolerance if geocoded street coordinate sits on road carriageway
+  const d = 0.00025;
   const geomEnv = encodeURIComponent(
-    `${(lng - d).toFixed(6)},${(lat - d).toFixed(6)},${(lng + d).toFixed(6)},${(lat + d).toFixed(6)}`,
+    JSON.stringify({
+      xmin: Number((lng - d).toFixed(6)),
+      ymin: Number((lat - d).toFixed(6)),
+      xmax: Number((lng + d).toFixed(6)),
+      ymax: Number((lat + d).toFixed(6)),
+      spatialReference: { wkid: 4326 },
+    }),
   );
   const envUrl = `${baseQueryUrl}?geometry=${geomEnv}&geometryType=esriGeometryEnvelope&inSR=4326&spatialRel=esriSpatialRelIntersects&${extraParams}&returnGeometry=true&outSR=4326&resultRecordCount=6&f=geojson`;
   const envData = await fetchJsonSafe(envUrl);

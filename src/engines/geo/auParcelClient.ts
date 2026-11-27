@@ -588,7 +588,13 @@ export async function fetchActBlocksGeoJson(bounds: {
 }): Promise<FeatureCollection<Polygon> | null> {
   try {
     const geom = encodeURIComponent(
-      `${bounds.west.toFixed(5)},${bounds.south.toFixed(5)},${bounds.east.toFixed(5)},${bounds.north.toFixed(5)}`,
+      JSON.stringify({
+        xmin: Number(bounds.west.toFixed(5)),
+        ymin: Number(bounds.south.toFixed(5)),
+        xmax: Number(bounds.east.toFixed(5)),
+        ymax: Number(bounds.north.toFixed(5)),
+        spatialReference: { wkid: 4326 },
+      }),
     );
     const where = encodeURIComponent("CURRENT_LIFECYCLE_STAGE='REGISTERED'");
     const url = `https://services1.arcgis.com/E5n4f1VY84i0xSjy/arcgis/rest/services/ACTGOV_BLOCKS/FeatureServer/0/query?geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326&spatialRel=esriSpatialRelIntersects&where=${where}&outFields=BLOCK_NUMBER,SECTION_NUMBER,DIVISION_NAME&returnGeometry=true&outSR=4326&resultRecordCount=150&f=geojson`;
