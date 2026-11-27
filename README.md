@@ -2,7 +2,9 @@
 
 **Commercial Australian GIS Terrain, Hydrology & Bulk Earthworks Workstation** — built natively on **GDA2020 / MGA2020 (Zones 49–56 / EPSG:7849–7856)** and **Australian Height Datum (AHD)**. Runs both **standalone** (ready for 1-click Vercel deployment) and **embedded inside `devaware-os`** with live `@devaware/os-bridge` sync into `Feaso OS`.
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/buildinvestmelb-maker/cutsheet-au)
+**Live Web App (Mobile & Desktop):** [https://buildinvestmelb-maker.github.io/cutsheet-au/](https://buildinvestmelb-maker.github.io/cutsheet-au/)
+
+[![Import & Deploy on Vercel](https://vercel.com/button)](https://vercel.com/new/import?s=https://github.com/buildinvestmelb-maker/cutsheet-au)
 
 ## Core Engineering Capabilities
 
