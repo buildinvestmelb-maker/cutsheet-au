@@ -185,6 +185,28 @@ async function fetchJsonSafe(url: string, timeoutMs = 8000): Promise<RawGeoJsonR
   return data;
 }
 
+async function fetchArcgisFeaturesWithBuffer(
+  baseQueryUrl: string,
+  lat: number,
+  lng: number,
+  extraParams: string,
+): Promise<RawGeoJsonResponse['features']> {
+  const geomPt = encodeURIComponent(`${lng},${lat}`);
+  const ptUrl = `${baseQueryUrl}?geometry=${geomPt}&geometryType=esriGeometryPoint&inSR=4326&spatialRel=esriSpatialRelIntersects&${extraParams}&returnGeometry=true&outSR=4326&f=geojson`;
+  const ptData = await fetchJsonSafe(ptUrl);
+  if (ptData?.features && ptData.features.length > 0) {
+    return ptData.features;
+  }
+  // Tight ~20m frontage tolerance if geocoded street coordinate sits on road carriageway
+  const d = 0.00022;
+  const geomEnv = encodeURIComponent(
+    `${(lng - d).toFixed(6)},${(lat - d).toFixed(6)},${(lng + d).toFixed(6)},${(lat + d).toFixed(6)}`,
+  );
+  const envUrl = `${baseQueryUrl}?geometry=${geomEnv}&geometryType=esriGeometryEnvelope&inSR=4326&spatialRel=esriSpatialRelIntersects&${extraParams}&returnGeometry=true&outSR=4326&resultRecordCount=6&f=geojson`;
+  const envData = await fetchJsonSafe(envUrl);
+  return envData?.features ?? [];
+}
+
 async function queryStateParcel(
   state: AustralianState,
   lat: number,
@@ -194,9 +216,15 @@ async function queryStateParcel(
 
   try {
     if (state === 'NSW') {
-      const url = `https://portal.spatial.nsw.gov.au/server/rest/services/NSW_Land_Parcel_Property_Theme/MapServer/8/query?geometry=${geomParam}&geometryType=esriGeometryPoint&inSR=4326&spatialRel=esriSpatialRelIntersects&outFields=lotnumber,sectionnumber,planlabel,cadid,classsubtype,area&returnGeometry=true&outSR=4326&f=geojson`;
-      const data = await fetchJsonSafe(url);
-      const feat = data?.features?.[0];
+      const feats =
+        (await fetchArcgisFeaturesWithBuffer(
+          'https://portal.spatial.nsw.gov.au/server/rest/services/NSW_Land_Parcel_Property_Theme/MapServer/8/query',
+          lat,
+          lng,
+          'outFields=*',
+        )) ?? [];
+      const feat =
+        feats.find((f) => cleanStr(f.properties?.planlabel).length > 0) ?? feats[0];
       const ring = extractPrimaryRing(feat?.geometry);
       if (feat && ring) {
         const p = feat.properties ?? {};
@@ -230,9 +258,20 @@ async function queryStateParcel(
 
     if (state === 'VIC') {
       const cql = encodeURIComponent(`INTERSECTS(geom,SRID=4326;POINT(${lng} ${lat}))`);
-      const url = `https://opendata.maps.vic.gov.au/geoserver/wfs?service=WFS&version=2.0.0&request=GetFeature&typeNames=open-data-platform:v_parcel_mp&outputFormat=application/json&srsName=EPSG:4326&cql_filter=${cql}&count=4`;
-      const data = await fetchJsonSafe(url);
-      const feats = data?.features ?? [];
+      let data = await fetchJsonSafe(
+        `https://opendata.maps.vic.gov.au/geoserver/wfs?service=WFS&version=2.0.0&request=GetFeature&typeNames=open-data-platform:v_parcel_mp&outputFormat=application/json&srsName=EPSG:4326&cql_filter=${cql}&count=4`,
+      );
+      let feats = data?.features ?? [];
+      if (feats.length === 0) {
+        const d = 0.00022;
+        const bboxCql = encodeURIComponent(
+          `BBOX(geom,${(lng - d).toFixed(6)},${(lat - d).toFixed(6)},${(lng + d).toFixed(6)},${(lat + d).toFixed(6)},'EPSG:4326')`,
+        );
+        data = await fetchJsonSafe(
+          `https://opendata.maps.vic.gov.au/geoserver/wfs?service=WFS&version=2.0.0&request=GetFeature&typeNames=open-data-platform:v_parcel_mp&outputFormat=application/json&srsName=EPSG:4326&cql_filter=${bboxCql}&count=6`,
+        );
+        feats = data?.features ?? [];
+      }
       const chosen =
         feats.find((f) => cleanStr(f.properties?.parcel_road).toUpperCase() !== 'Y') ?? feats[0];
       const ring = extractPrimaryRing(chosen?.geometry);
@@ -266,9 +305,13 @@ async function queryStateParcel(
     }
 
     if (state === 'QLD') {
-      const url = `https://spatial-gis.information.qld.gov.au/arcgis/rest/services/PlanningCadastre/LandParcelPropertyFramework/MapServer/4/query?geometry=${geomParam}&geometryType=esriGeometryPoint&inSR=4326&spatialRel=esriSpatialRelIntersects&outFields=lot,plan,lotplan,tenure,lot_area,locality,parcel_typ,feat_name&returnGeometry=true&outSR=4326&f=geojson`;
-      const data = await fetchJsonSafe(url);
-      const feats = data?.features ?? [];
+      const feats =
+        (await fetchArcgisFeaturesWithBuffer(
+          'https://spatial-gis.information.qld.gov.au/arcgis/rest/services/PlanningCadastre/LandParcelPropertyFramework/MapServer/4/query',
+          lat,
+          lng,
+          'outFields=lot,plan,lotplan,tenure,lot_area,locality,parcel_typ,feat_name',
+        )) ?? [];
       const chosen =
         feats.find(
           (f) =>
@@ -308,9 +351,14 @@ async function queryStateParcel(
     }
 
     if (state === 'WA') {
-      const url = `https://public-services.slip.wa.gov.au/public/rest/services/SLIP_Public_Services/Property_and_Planning/MapServer/2/query?geometry=${geomParam}&geometryType=esriGeometryPoint&inSR=4326&spatialRel=esriSpatialRelIntersects&outFields=*&returnGeometry=true&outSR=4326&f=geojson`;
-      const data = await fetchJsonSafe(url);
-      const feat = data?.features?.[0];
+      const feats =
+        (await fetchArcgisFeaturesWithBuffer(
+          'https://public-services.slip.wa.gov.au/public/rest/services/SLIP_Public_Services/Property_and_Planning/MapServer/2/query',
+          lat,
+          lng,
+          'outFields=*',
+        )) ?? [];
+      const feat = feats[0];
       const ring = extractPrimaryRing(feat?.geometry);
       if (feat && ring) {
         const p = feat.properties ?? {};
@@ -339,9 +387,13 @@ async function queryStateParcel(
     }
 
     if (state === 'TAS') {
-      const url = `https://services.thelist.tas.gov.au/arcgis/rest/services/Public/CadastreParcels/MapServer/0/query?geometry=${geomParam}&geometryType=esriGeometryPoint&inSR=4326&spatialRel=esriSpatialRelIntersects&outFields=VOLUME,FOLIO,PID,CAD_TYPE1,TENURE_TY,FEAT_NAME,COMP_AREA&returnGeometry=true&outSR=4326&f=geojson`;
-      const data = await fetchJsonSafe(url);
-      const feats = data?.features ?? [];
+      const feats =
+        (await fetchArcgisFeaturesWithBuffer(
+          'https://services.thelist.tas.gov.au/arcgis/rest/services/Public/CadastreParcels/MapServer/0/query',
+          lat,
+          lng,
+          'outFields=VOLUME,FOLIO,PID,CAD_TYPE1,TENURE_TY,FEAT_NAME,COMP_AREA',
+        )) ?? [];
       const chosen =
         feats.find(
           (f) => cleanStr(f.properties?.CAD_TYPE1).toLowerCase() === 'private parcel',
@@ -381,10 +433,15 @@ async function queryStateParcel(
     }
 
     if (state === 'ACT') {
-      const where = encodeURIComponent("CURRENT_LIFECYCLE_STAGE='CURRENT'");
-      const url = `https://services1.arcgis.com/E5n4f1VY84i0xSjy/arcgis/rest/services/ACTGOV_BLOCKS/FeatureServer/0/query?geometry=${geomParam}&geometryType=esriGeometryPoint&inSR=4326&spatialRel=esriSpatialRelIntersects&where=${where}&outFields=BLOCK_NUMBER,SECTION_NUMBER,DIVISION_NAME,ADDRESSES,PLAN_NUMBERS,BLOCK_DERIVED_AREA&returnGeometry=true&outSR=4326&f=geojson`;
-      const data = await fetchJsonSafe(url);
-      const feat = data?.features?.[0];
+      const where = encodeURIComponent("CURRENT_LIFECYCLE_STAGE='REGISTERED'");
+      const feats =
+        (await fetchArcgisFeaturesWithBuffer(
+          'https://services1.arcgis.com/E5n4f1VY84i0xSjy/arcgis/rest/services/ACTGOV_BLOCKS/FeatureServer/0/query',
+          lat,
+          lng,
+          `where=${where}&outFields=*`,
+        )) ?? [];
+      const feat = feats[0];
       const ring = extractPrimaryRing(feat?.geometry);
       if (feat && ring) {
         const p = feat.properties ?? {};
@@ -407,7 +464,7 @@ async function queryStateParcel(
           parcelLabel: parcelId,
           address: cleanStr(p.ADDRESSES),
           tenure: 'ACT Crown Lease Block',
-          zoneName: '',
+          zoneName: cleanStr(p.LAND_USE_POLICY_ZONES),
           areaSqm,
           provenance: 'live-state-cadastre',
           featureCollection: makeParcelFc(ring, {
@@ -421,16 +478,29 @@ async function queryStateParcel(
     }
 
     if (state === 'NT') {
-      const url = `https://gis-d.nt.gov.au/arcgis/rest/services/NT_CADASTRE/MapServer/0/query?geometry=${geomParam}&geometryType=esriGeometryPoint&inSR=4326&spatialRel=esriSpatialRelIntersects&outFields=PARCEL_ADDRESS,LAISKEY,UFI,PARCEL_TYPE,SURVEY_PLAN&returnGeometry=true&outSR=4326&f=geojson`;
-      const data = await fetchJsonSafe(url);
-      const feat = data?.features?.[0];
+      const feats =
+        (await fetchArcgisFeaturesWithBuffer(
+          'https://gis-d.nt.gov.au/arcgis/rest/services/NT_CADASTRE/MapServer/0/query',
+          lat,
+          lng,
+          'outFields=*',
+        )) ?? [];
+      const feat =
+        feats.find((f) => cleanStr(f.properties?.LAISKEY).length > 0) ?? feats[0];
       const ring = extractPrimaryRing(feat?.geometry);
       if (feat && ring) {
         const p = feat.properties ?? {};
         const addr = cleanStr(p.PARCEL_ADDRESS);
         const lais = cleanStr(p.LAISKEY);
         const ufi = cleanStr(p.UFI);
-        const parcelId = lais ? `NT LAIS ${lais}` : ufi ? `NT UFI ${ufi}` : 'NT Cadastre Parcel';
+        const parcel = cleanStr(p.PARCEL);
+        const parcelId = lais
+          ? `NT LAIS ${lais}`
+          : parcel
+            ? `NT Lot ${parcel}`
+            : ufi
+              ? `NT UFI ${ufi}`
+              : 'NT Cadastre Parcel';
         const areaSqm = Math.round(ringAreaSqm(ring));
         return {
           matched: true,
@@ -439,7 +509,7 @@ async function queryStateParcel(
           parcelId,
           parcelLabel: addr || parcelId,
           address: addr,
-          tenure: cleanStr(p.PARCEL_TYPE) || 'NT Cadastre Lot',
+          tenure: cleanStr(p.PARCEL_TYPE) || cleanStr(p.LTO_CODE) || 'NT Cadastre Lot',
           zoneName: '',
           areaSqm,
           provenance: 'live-state-cadastre',

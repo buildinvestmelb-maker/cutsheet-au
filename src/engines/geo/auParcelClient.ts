@@ -406,7 +406,7 @@ async function tryDirectCorsParcelSnap(
     }
 
     if (state === 'ACT') {
-      const where = encodeURIComponent("CURRENT_LIFECYCLE_STAGE='CURRENT'");
+      const where = encodeURIComponent("CURRENT_LIFECYCLE_STAGE='REGISTERED'");
       const url = `https://services1.arcgis.com/E5n4f1VY84i0xSjy/arcgis/rest/services/ACTGOV_BLOCKS/FeatureServer/0/query?geometry=${encodeURIComponent(`${lng},${lat}`)}&geometryType=esriGeometryPoint&inSR=4326&spatialRel=esriSpatialRelIntersects&where=${where}&outFields=BLOCK_NUMBER,SECTION_NUMBER,DIVISION_NAME,ADDRESSES&returnGeometry=true&outSR=4326&f=geojson`;
       const res = await fetch(url, { signal: AbortSignal.timeout(7000) });
       if (!res.ok) return null;
@@ -590,7 +590,7 @@ export async function fetchActBlocksGeoJson(bounds: {
     const geom = encodeURIComponent(
       `${bounds.west.toFixed(5)},${bounds.south.toFixed(5)},${bounds.east.toFixed(5)},${bounds.north.toFixed(5)}`,
     );
-    const where = encodeURIComponent("CURRENT_LIFECYCLE_STAGE='CURRENT'");
+    const where = encodeURIComponent("CURRENT_LIFECYCLE_STAGE='REGISTERED'");
     const url = `https://services1.arcgis.com/E5n4f1VY84i0xSjy/arcgis/rest/services/ACTGOV_BLOCKS/FeatureServer/0/query?geometry=${geom}&geometryType=esriGeometryEnvelope&inSR=4326&spatialRel=esriSpatialRelIntersects&where=${where}&outFields=BLOCK_NUMBER,SECTION_NUMBER,DIVISION_NAME&returnGeometry=true&outSR=4326&resultRecordCount=150&f=geojson`;
     const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
     if (!res.ok) return null;
